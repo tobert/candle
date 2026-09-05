@@ -18,6 +18,7 @@
 
 mod compile;
 mod error;
+pub mod exit;
 mod wrappers;
 
 pub use compile::{KernelCache, MmqTiles};

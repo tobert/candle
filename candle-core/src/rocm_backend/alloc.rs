@@ -36,41 +36,11 @@
 
 use std::collections::HashMap;
 use std::marker::PhantomData;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, Once};
+use std::sync::{Arc, Mutex, MutexGuard};
 
-/// Set once the process has entered `exit`. After that point the HIP runtime
-/// may already be torn down, and `hipFree` segfaults instead of returning an
-/// error, so [`RocmAllocator::release_all`] stops calling it.
-static PROCESS_EXITING: AtomicBool = AtomicBool::new(false);
-static EXIT_HOOK: Once = Once::new();
-
-extern "C" fn mark_process_exiting() {
-    PROCESS_EXITING.store(true, Ordering::SeqCst);
-}
-
-/// True once `exit` has begun. Device handles must not be released after
-/// this point: the HIP runtime may already be torn down and faults instead
-/// of returning an error.
-pub(crate) fn process_exiting() -> bool {
-    PROCESS_EXITING.load(Ordering::SeqCst)
-}
-
-/// Register the exit hook. Called when the first device is created, i.e.
-/// after `hipInit`, so this handler runs before HIP's own teardown (atexit
-/// handlers run in reverse registration order).
-pub(crate) fn register_exit_hook() {
-    EXIT_HOOK.call_once(|| {
-        // SAFETY: `mark_process_exiting` is a plain extern "C" fn with no
-        // arguments, which is exactly what atexit expects.
-        let rc = unsafe { libc::atexit(mark_process_exiting) };
-        if rc != 0 {
-            // Not fatal: the process merely keeps the original crash-at-exit
-            // behaviour. Say so rather than hide it.
-            eprintln!("candle rocm: atexit registration failed ({rc}); device frees at exit are not guarded");
-        }
-    });
-}
+/// The process-exit guard lives in `candle_rocm_kernels::exit` so the module
+/// wrapper down there can share it; see that module for why it exists.
+pub(crate) use candle_rocm_kernels::exit::{process_exiting, register_exit_hook};
 
 use rocm_rs::hip::bindings;
 use rocm_rs::hip::error::Error as HipError;
@@ -189,7 +159,7 @@ impl RocmAllocator {
     /// this runs only when the device is being torn down or an allocation has
     /// already failed.
     fn release_all(&self) {
-        if PROCESS_EXITING.load(Ordering::SeqCst) {
+        if process_exiting() {
             // The runtime may be gone; the OS reclaims device memory at exit.
             return;
         }

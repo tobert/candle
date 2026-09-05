@@ -1,3 +1,4 @@
+use std::mem::ManuallyDrop;
 use std::ops::Deref;
 
 use rocm_rs::hip::Module;
@@ -8,7 +9,14 @@ use rocm_rs::hip::Module;
 /// constructor: the `unsafe impl`s below assert a property of *this* wrapper,
 /// so safe code outside the crate must not be able to wrap an arbitrary
 /// `Module` and get `Send + Sync` for free.
-pub struct SendSyncModule(Module);
+pub struct SendSyncModule(ManuallyDrop<Module>);
+
+impl Drop for SendSyncModule {
+    fn drop(&mut self) {
+        // `hipModuleUnload` after HIP's own atexit teardown corrupts the heap.
+        crate::exit::drop_unless_exiting(&mut self.0);
+    }
+}
 
 // SAFETY: the wrapper's only state is a `hipModule_t`, a process-wide handle
 // owned by the primary context rather than by any one thread. HIP places no
@@ -23,7 +31,7 @@ unsafe impl Sync for SendSyncModule {}
 
 impl SendSyncModule {
     pub fn load_data(data: impl AsRef<[u8]>) -> Result<Self, rocm_rs::hip::error::Error> {
-        Ok(Self(Module::load_data(data)?))
+        Ok(Self(ManuallyDrop::new(Module::load_data(data)?)))
     }
 }
 
