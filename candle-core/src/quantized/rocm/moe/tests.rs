@@ -20,13 +20,17 @@ macro_rules! rocm_device {
 }
 
 /// Every dtype with an `indexed_moe_forward_*_q8_1` kernel.
-const MOE_DTYPES: [GgmlDType; 6] = [
+const MOE_DTYPES: [GgmlDType; 10] = [
     GgmlDType::Q2K,
     GgmlDType::Q3K,
     GgmlDType::Q4K,
     GgmlDType::Q5K,
     GgmlDType::Q6K,
     GgmlDType::Q8_0,
+    GgmlDType::Q4_0,
+    GgmlDType::Q4_1,
+    GgmlDType::Q5_0,
+    GgmlDType::Q5_1,
 ];
 
 /// Deterministic, spread over a couple of octaves so quantization has something
@@ -165,11 +169,11 @@ fn indexed_moe_single_token_matches_the_cpu_rocm() -> Result<()> {
 fn indexed_moe_rejects_a_dtype_without_a_kernel_rocm() -> Result<()> {
     let device = rocm_device!();
     let w = Tensor::zeros((2, 32, 256), crate::DType::F32, &device)?;
-    let qw = QTensor::quantize(&w, GgmlDType::Q4_0)?;
+    let qw = QTensor::quantize(&w, GgmlDType::F16)?;
     let x = Tensor::zeros((1, 1, 256), crate::DType::F32, &device)?;
     let ids = Tensor::from_vec(vec![0u32], (1, 1), &device)?;
     let err = qw.indexed_moe_forward(&x, &ids).unwrap_err().to_string();
-    assert!(err.contains("Q4_0"), "unexpected error: {err}");
+    assert!(err.contains("F16"), "unexpected error: {err}");
     Ok(())
 }
 

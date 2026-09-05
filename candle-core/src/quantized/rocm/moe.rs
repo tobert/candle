@@ -34,6 +34,10 @@ fn kernel_name(dtype: GgmlDType) -> Option<&'static str> {
         GgmlDType::Q5K => "indexed_moe_forward_q5k_q8_1",
         GgmlDType::Q6K => "indexed_moe_forward_q6k_q8_1",
         GgmlDType::Q8_0 => "indexed_moe_forward_q8_0_q8_1",
+        GgmlDType::Q4_0 => "indexed_moe_forward_q4_0_q8_1",
+        GgmlDType::Q4_1 => "indexed_moe_forward_q4_1_q8_1",
+        GgmlDType::Q5_0 => "indexed_moe_forward_q5_0_q8_1",
+        GgmlDType::Q5_1 => "indexed_moe_forward_q5_1_q8_1",
         _ => return None,
     };
     Some(name)
