@@ -59,7 +59,8 @@ impl RocmDevice {
         // (see `alloc`) — but anything added later that touches the null stream
         // would be silently ordered by it, and would stop being ordered if the
         // stream ever became `hipStreamNonBlocking`.
-        let stream = Arc::new(SendSyncStream(device.get_stream()?));
+        let stream = Arc::new(SendSyncStream::new(device.get_stream()?));
+        super::alloc::register_exit_hook();
         let allocator = Arc::new(RocmAllocator::new(stream.clone()));
 
         let mut rocrand = SendSyncPseudoRng::new(rocm_rs::rocrand::rng_type::PSEUDO_DEFAULT)
@@ -261,7 +262,7 @@ impl RocmDevice {
     /// Get a reference to the underlying HIP stream.
     /// This is public so that candle-nn and other crates can launch custom kernels.
     pub fn stream(&self) -> &rocm_rs::hip::Stream {
-        &self.stream.0
+        &self.stream
     }
 
     /// Locks the rocrand generator.

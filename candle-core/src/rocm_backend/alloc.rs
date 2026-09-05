@@ -36,7 +36,41 @@
 
 use std::collections::HashMap;
 use std::marker::PhantomData;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, Once};
+
+/// Set once the process has entered `exit`. After that point the HIP runtime
+/// may already be torn down, and `hipFree` segfaults instead of returning an
+/// error, so [`RocmAllocator::release_all`] stops calling it.
+static PROCESS_EXITING: AtomicBool = AtomicBool::new(false);
+static EXIT_HOOK: Once = Once::new();
+
+extern "C" fn mark_process_exiting() {
+    PROCESS_EXITING.store(true, Ordering::SeqCst);
+}
+
+/// True once `exit` has begun. Device handles must not be released after
+/// this point: the HIP runtime may already be torn down and faults instead
+/// of returning an error.
+pub(crate) fn process_exiting() -> bool {
+    PROCESS_EXITING.load(Ordering::SeqCst)
+}
+
+/// Register the exit hook. Called when the first device is created, i.e.
+/// after `hipInit`, so this handler runs before HIP's own teardown (atexit
+/// handlers run in reverse registration order).
+pub(crate) fn register_exit_hook() {
+    EXIT_HOOK.call_once(|| {
+        // SAFETY: `mark_process_exiting` is a plain extern "C" fn with no
+        // arguments, which is exactly what atexit expects.
+        let rc = unsafe { libc::atexit(mark_process_exiting) };
+        if rc != 0 {
+            // Not fatal: the process merely keeps the original crash-at-exit
+            // behaviour. Say so rather than hide it.
+            eprintln!("candle rocm: atexit registration failed ({rc}); device frees at exit are not guarded");
+        }
+    });
+}
 
 use rocm_rs::hip::bindings;
 use rocm_rs::hip::error::Error as HipError;
@@ -109,7 +143,7 @@ impl RocmAllocator {
     }
 
     pub(crate) fn raw_stream(&self) -> bindings::hipStream_t {
-        self.stream.0.as_raw()
+        self.stream.as_raw()
     }
 
     /// Poisoning is ignored: the map is a pure cache, so the worst a panic
@@ -155,6 +189,10 @@ impl RocmAllocator {
     /// this runs only when the device is being torn down or an allocation has
     /// already failed.
     fn release_all(&self) {
+        if PROCESS_EXITING.load(Ordering::SeqCst) {
+            // The runtime may be gone; the OS reclaims device memory at exit.
+            return;
+        }
         for (_, blocks) in self.lock_free().drain() {
             for block in blocks {
                 // SAFETY: every block came from `hipMalloc` and is not

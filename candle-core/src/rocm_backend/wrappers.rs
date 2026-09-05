@@ -8,13 +8,36 @@
 //! below has to pin down. Device memory lives in [`super::alloc`], not here: it
 //! needs an allocator, not just a wrapper.
 
+use std::mem::ManuallyDrop;
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
+
+/// Drop `handle` unless the process is exiting, in which case leak it: the
+/// HIP runtime's own atexit teardown may already have run, and every
+/// `*_destroy` below faults rather than erroring once it has.
+fn drop_unless_exiting<T>(handle: &mut ManuallyDrop<T>) {
+    if !super::alloc::process_exiting() {
+        // SAFETY: called exactly once, from the owning wrapper's `Drop`.
+        unsafe { ManuallyDrop::drop(handle) }
+    }
+}
 
 use rocm_rs::hip::Stream;
 use rocm_rs::rocrand::PseudoRng;
 
-pub struct SendSyncStream(pub Stream);
+pub struct SendSyncStream(ManuallyDrop<Stream>);
+
+impl SendSyncStream {
+    pub fn new(stream: Stream) -> Self {
+        Self(ManuallyDrop::new(stream))
+    }
+}
+
+impl Drop for SendSyncStream {
+    fn drop(&mut self) {
+        drop_unless_exiting(&mut self.0);
+    }
+}
 
 // SAFETY: a `hipStream_t` is a driver object owned by the process, not by the
 // thread that created it. HIP's own API is thread-safe for concurrent
@@ -32,7 +55,13 @@ impl Deref for SendSyncStream {
     }
 }
 
-pub struct SendSyncRocblasHandle(pub rocm_rs::rocblas::Handle);
+pub struct SendSyncRocblasHandle(ManuallyDrop<rocm_rs::rocblas::Handle>);
+
+impl Drop for SendSyncRocblasHandle {
+    fn drop(&mut self) {
+        drop_unless_exiting(&mut self.0);
+    }
+}
 
 // SAFETY: rocBLAS is documented thread-safe for concurrent calls against one
 // handle; the exception is the handle's *own* mutable state, of which this
@@ -46,7 +75,7 @@ unsafe impl Sync for SendSyncRocblasHandle {}
 
 impl SendSyncRocblasHandle {
     pub fn new() -> Result<Self, rocm_rs::rocblas::error::Error> {
-        Ok(Self(rocm_rs::rocblas::Handle::new()?))
+        Ok(Self(ManuallyDrop::new(rocm_rs::rocblas::Handle::new()?)))
     }
 }
 
@@ -94,11 +123,17 @@ impl RocmBlas {
 
     /// The stream this handle is bound to — the owning device's own.
     pub fn stream(&self) -> &Stream {
-        &self.stream.0
+        &self.stream
     }
 }
 
-pub struct SendSyncPseudoRng(pub PseudoRng);
+pub struct SendSyncPseudoRng(ManuallyDrop<PseudoRng>);
+
+impl Drop for SendSyncPseudoRng {
+    fn drop(&mut self) {
+        drop_unless_exiting(&mut self.0);
+    }
+}
 
 // SAFETY: unlike the other handles here, a rocRAND generator genuinely is *not*
 // thread-safe — it carries mutable offset state that two concurrent
@@ -113,7 +148,7 @@ unsafe impl Sync for SendSyncPseudoRng {}
 
 impl SendSyncPseudoRng {
     pub fn new(rng_type: u32) -> Result<Self, rocm_rs::rocrand::error::Error> {
-        Ok(Self(PseudoRng::new(rng_type)?))
+        Ok(Self(ManuallyDrop::new(PseudoRng::new(rng_type)?)))
     }
 }
 
@@ -131,7 +166,14 @@ impl DerefMut for SendSyncPseudoRng {
 }
 
 #[cfg(feature = "miopen")]
-pub struct SendSyncMIOpenHandle(pub rocm_rs::miopen::Handle);
+pub struct SendSyncMIOpenHandle(ManuallyDrop<rocm_rs::miopen::Handle>);
+
+#[cfg(feature = "miopen")]
+impl Drop for SendSyncMIOpenHandle {
+    fn drop(&mut self) {
+        drop_unless_exiting(&mut self.0);
+    }
+}
 
 // SAFETY: a `miopenHandle_t` is a process-wide driver object, and this one's
 // stream is bound once at construction and never rebound, so moving it between
@@ -150,7 +192,7 @@ unsafe impl Sync for SendSyncMIOpenHandle {}
 impl SendSyncMIOpenHandle {
     pub fn new(stream: &Stream) -> Result<Self, rocm_rs::miopen::error::Error> {
         let handle = rocm_rs::miopen::Handle::with_stream(stream)?;
-        Ok(Self(handle))
+        Ok(Self(ManuallyDrop::new(handle)))
     }
 }
 
