@@ -156,6 +156,37 @@ mod tests {
     }
 
     #[test]
+    fn reductions_and_index_select_cache_metadata_not_values() -> Result<()> {
+        use crate::{Device, Tensor};
+        let dev = RocmDevice::new(0)?;
+        let device = Device::Rocm(dev.clone());
+        for offset in [0f32, 10.] {
+            let values: Vec<f32> = (0..6).map(|i| i as f32 + offset).collect();
+            let xs = Tensor::from_vec(values, (2, 3), &device)?;
+            assert_eq!(
+                xs.sum(1)?.to_vec1::<f32>()?,
+                vec![3. + 3. * offset, 12. + 3. * offset]
+            );
+            assert!(dev
+                .param_cache()
+                .lock()
+                .unwrap()
+                .contains_key(&vec![2, 3, 3, 1]));
+            let ids = Tensor::from_vec(vec![2u32, 0, 1], 3, &device)?;
+            assert_eq!(
+                xs.index_select(&ids, 1)?.to_vec2::<f32>()?,
+                vec![
+                    vec![2. + offset, offset, 1. + offset],
+                    vec![5. + offset, 3. + offset, 4. + offset],
+                ]
+            );
+            assert!(dev.param_cache().lock().unwrap().contains_key(&vec![3, 1]));
+            assert_eq!(dev.param_cache().lock().unwrap().len(), 2);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn different_params_get_different_buffers() -> Result<()> {
         let dev = device!();
         let a = params_from_vec(&dev, vec![2, 3, 3, 1])?;

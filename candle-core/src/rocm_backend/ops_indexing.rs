@@ -66,7 +66,7 @@ impl Map1 for IndexSelect<'_> {
         let num_dims = ids_dims.len();
         // `IS_OP` dereferences `info` unconditionally to test contiguity, so it
         // never accepts a null pointer here the way the elementwise ops do.
-        let ds = dev.clone_htod(&[ids_dims, ids_l.stride()].concat())?;
+        let ds = super::params::params_from_vec(dev, [ids_dims, ids_l.stride()].concat())?;
 
         let src_ptr = unsafe { src.ptr_at(contiguous_offset(src_l, "index-select")?) };
 

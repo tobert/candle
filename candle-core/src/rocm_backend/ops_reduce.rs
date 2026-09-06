@@ -63,7 +63,7 @@ impl Map1Any for FastReduce<'_> {
         let func_name = try_kernel_name::<T>(name)?;
 
         let ds_data: Vec<usize> = [dims.as_slice(), stride.as_slice()].concat();
-        let ds = dev.clone_htod(&ds_data)?;
+        let ds = super::params::params_from_vec(dev, ds_data)?;
 
         // `fast_*` maps one block to one output element, so the grid is sized by
         // the output rather than through `launch_config`. `hipModuleLaunchKernel`
