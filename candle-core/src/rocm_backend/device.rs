@@ -327,6 +327,20 @@ impl RocmDevice {
             .w()
     }
 
+    /// Load a precompiled HIP code object on this device with the same lifetime as cached kernels.
+    pub fn get_or_load_binary_func(
+        &self,
+        kernel_name: &str,
+        module_name: &str,
+        binary: &[u8],
+        arch: &str,
+    ) -> crate::Result<rocm_rs::hip::Function> {
+        self.bind()?;
+        self.kernel_manager
+            .binary_function(module_name, binary, arch, kernel_name)
+            .w()
+    }
+
     /// Compile a `ug` micro-kernel for this device, the counterpart of
     /// `CudaDevice::compile`.
     ///

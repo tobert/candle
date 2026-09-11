@@ -37,6 +37,10 @@ enum ModuleName {
         name: String,
         source: [u8; 32],
     },
+    Binary {
+        name: String,
+        digest: [u8; 32],
+    },
 }
 
 impl ModuleName {
@@ -44,6 +48,7 @@ impl ModuleName {
         match self {
             ModuleName::BuiltIn(name) => name,
             ModuleName::Custom { name, .. } => name.as_str(),
+            ModuleName::Binary { name, .. } => name.as_str(),
         }
     }
 
@@ -55,6 +60,7 @@ impl ModuleName {
         match self {
             ModuleName::BuiltIn(name) => cache::path_component(name),
             ModuleName::Custom { name, .. } => format!("custom-{}", cache::path_component(name)),
+            ModuleName::Binary { name, .. } => format!("binary-{}", cache::path_component(name)),
         }
     }
 }
@@ -268,6 +274,43 @@ impl KernelCache {
     ) -> Result<rocm_rs::hip::Function, KernelError> {
         let loaded = self.get_or_load_custom(module_name, source)?;
         resolve(&loaded, module_name, name)
+    }
+
+    /// Load a precompiled code object, retaining it for the lifetime of returned function handles.
+    pub fn binary_function(
+        &self,
+        module_name: &str,
+        binary: &[u8],
+        arch: &str,
+        kernel_name: &str,
+    ) -> Result<rocm_rs::hip::Function, KernelError> {
+        use sha2::{Digest, Sha256};
+        if arch != self.arch {
+            return Err(KernelError::Compilation(format!(
+                "code object targets {arch}, device is {}",
+                self.arch
+            )));
+        }
+        let name = ModuleName::Binary {
+            name: module_name.to_string(),
+            digest: Sha256::digest(binary).into(),
+        };
+        if let Some(loaded) = self.read_modules()?.get(&name) {
+            return resolve(loaded, module_name, kernel_name);
+        }
+        let gate = self.compile_gate(&name)?;
+        let _loading = gate
+            .lock()
+            .map_err(|_| KernelError::Internal("binary module lock is poisoned".to_string()))?;
+        if let Some(loaded) = self.read_modules()?.get(&name) {
+            return resolve(loaded, module_name, kernel_name);
+        }
+        let loaded = Arc::new(SendSyncModule::load_data(binary).map_err(|e| {
+            KernelError::Compilation(format!("failed to load code object {module_name}: {e}"))
+        })?);
+        self.write_modules()?.insert(name.clone(), loaded.clone());
+        self.release_compile_gate(&name)?;
+        resolve(&loaded, module_name, kernel_name)
     }
 
     /// Read the module's code object from the disk cache, compiling it first if
