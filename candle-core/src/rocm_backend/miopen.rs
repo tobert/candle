@@ -99,6 +99,14 @@ struct AlgoKey {
 /// synchronises the whole device — correct by accident, at the price of a full
 /// device sync per convolution. Keeping it here also means the alloc happens
 /// once per problem shape instead of once per forward pass.
+///
+/// NEVER DROPPED, and that is load-bearing: `workspace` is a raw
+/// `rocm_rs::hip::DeviceMemory`, whose `Drop` calls `hipFree` outside
+/// `candle_rocm_kernels::exit`'s release gate. It is safe only because the cache
+/// is a `static` (Rust never drops statics) with no eviction. Evicting entries,
+/// or moving the cache somewhere that drops at exit, would issue ungated frees
+/// that can race libamdhip64's atexit teardown; route the workspace through
+/// `RocmAllocator` first.
 struct CachedAlgo {
     algo: ConvFwdAlgorithm,
     workspace_size: usize,

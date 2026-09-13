@@ -12,15 +12,11 @@ use std::mem::ManuallyDrop;
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 
-/// Drop `handle` unless the process is exiting, in which case leak it: the
-/// HIP runtime's own atexit teardown may already have run, and every
-/// `*_destroy` below faults rather than erroring once it has.
-fn drop_unless_exiting<T>(handle: &mut ManuallyDrop<T>) {
-    if !super::alloc::process_exiting() {
-        // SAFETY: called exactly once, from the owning wrapper's `Drop`.
-        unsafe { ManuallyDrop::drop(handle) }
-    }
-}
+// Every wrapper below drops its handle through this shared guard: leak it if
+// the process is exiting (HIP's atexit teardown may already have run, and each
+// `*_destroy` faults rather than erroring once it has), and otherwise hold
+// exit off until the destroy has finished.
+use candle_rocm_kernels::exit::drop_unless_exiting;
 
 use rocm_rs::hip::Stream;
 use rocm_rs::rocrand::PseudoRng;

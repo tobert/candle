@@ -40,7 +40,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 /// The process-exit guard lives in `candle_rocm_kernels::exit` so the module
 /// wrapper down there can share it; see that module for why it exists.
-pub(crate) use candle_rocm_kernels::exit::{process_exiting, register_exit_hook};
+pub(crate) use candle_rocm_kernels::exit::{begin_release, register_exit_hook};
 
 use rocm_rs::hip::bindings;
 use rocm_rs::hip::error::Error as HipError;
@@ -159,10 +159,13 @@ impl RocmAllocator {
     /// this runs only when the device is being torn down or an allocation has
     /// already failed.
     fn release_all(&self) {
-        if process_exiting() {
-            // The runtime may be gone; the OS reclaims device memory at exit.
+        // Held across the whole loop: the exit hook waits for it, so HIP's
+        // teardown cannot start between two `hipFree`s.
+        let Some(_release) = begin_release() else {
+            // Exit has begun; the runtime may be gone and the OS reclaims
+            // device memory at exit.
             return;
-        }
+        };
         for (_, blocks) in self.lock_free().drain() {
             for block in blocks {
                 // SAFETY: every block came from `hipMalloc` and is not
