@@ -168,11 +168,88 @@ impl FeedForward {
     }
 }
 
+// Merge compatible packed projections at load time, following vLLM's QKV
+// projection layout. Mixed-format V remains separate without requantization.
+#[derive(Debug, Clone)]
+enum QkvProjection {
+    Fused {
+        weight: QMatMul,
+        q: usize,
+        kv: usize,
+    },
+    Qk {
+        weight: QMatMul,
+        value: QMatMul,
+        q: usize,
+        kv: usize,
+    },
+    Separate {
+        query: QMatMul,
+        key: QMatMul,
+        value: QMatMul,
+    },
+}
+impl QkvProjection {
+    fn new(query: QTensor, key: QTensor, value: QTensor) -> Result<Self> {
+        let (q, k) = query.shape().dims2()?;
+        let (kv, kk) = key.shape().dims2()?;
+        if q == 0 || kv == 0 || k == 0 || kk != k || value.shape().dims() != [kv, k] {
+            bail!("incompatible LFM2 QKV projection dimensions")
+        }
+        if query.dtype() == key.dtype() && key.dtype() == value.dtype() {
+            Ok(Self::Fused {
+                weight: QMatMul::from_qtensor(QTensor::cat(&[&query, &key, &value], 0)?)?,
+                q,
+                kv,
+            })
+        } else if query.dtype() == key.dtype() {
+            Ok(Self::Qk {
+                weight: QMatMul::from_qtensor(QTensor::cat(&[&query, &key], 0)?)?,
+                value: QMatMul::from_qtensor(value)?,
+                q,
+                kv,
+            })
+        } else {
+            Ok(Self::Separate {
+                query: QMatMul::from_qtensor(query)?,
+                key: QMatMul::from_qtensor(key)?,
+                value: QMatMul::from_qtensor(value)?,
+            })
+        }
+    }
+    fn forward(&self, x: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
+        match self {
+            Self::Fused { weight, q, kv } => {
+                let y = weight.forward(x)?;
+                Ok((
+                    y.narrow(D::Minus1, 0, *q)?,
+                    y.narrow(D::Minus1, *q, *kv)?,
+                    y.narrow(D::Minus1, q + kv, *kv)?,
+                ))
+            }
+            Self::Qk {
+                weight,
+                value,
+                q,
+                kv,
+            } => {
+                let y = weight.forward(x)?;
+                Ok((
+                    y.narrow(D::Minus1, 0, *q)?,
+                    y.narrow(D::Minus1, *q, *kv)?,
+                    value.forward(x)?,
+                ))
+            }
+            Self::Separate { query, key, value } => {
+                Ok((query.forward(x)?, key.forward(x)?, value.forward(x)?))
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct AttentionLayer {
-    wq: QMatMul,
-    wk: QMatMul,
-    wv: QMatMul,
+    qkv: QkvProjection,
     wo: QMatMul,
     q_norm: RmsNorm,
     k_norm: RmsNorm,
@@ -225,9 +302,7 @@ impl AttentionLayer {
         let _enter = self.span_attn.enter();
         let (b_sz, seq_len, n_embd) = xs.dims3()?;
 
-        let q = self.wq.forward(xs)?;
-        let k = self.wk.forward(xs)?;
-        let v = self.wv.forward(xs)?;
+        let (q, k, v) = self.qkv.forward(xs)?;
 
         let q = q
             .reshape((b_sz, seq_len, self.n_head, self.head_dim))?
@@ -363,6 +438,11 @@ impl Model {
             conv: vec![None; self.layers.len()],
         }
     }
+    /// Whether a snapshot belongs to this loaded model instance. Useful when
+    /// reusing saved logits without immediately executing another forward.
+    pub fn owns_state(&self, state: &State) -> bool {
+        Arc::ptr_eq(&state.owner, &self.owner)
+    }
     pub fn context_length(&self) -> usize {
         self.context
     }
@@ -376,7 +456,7 @@ impl Model {
     /// Batch-one forward, returning next-token logits. Caller bounds prefill
     /// chunks; all validation happens before committing the new state.
     pub fn forward(&self, tokens: &[u32], state: &mut State) -> Result<Tensor> {
-        if !Arc::ptr_eq(&state.owner, &self.owner) {
+        if !self.owns_state(state) {
             bail!("snapshot belongs to another model")
         }
         let seq = tokens.len();
@@ -535,9 +615,11 @@ impl Model {
             };
             let operator = if nkv > 0 {
                 Operator::Attention(Box::new(AttentionLayer {
-                    wq: QMatMul::from_qtensor(t("attn_q.weight", &[hidden, hidden])?)?,
-                    wk: QMatMul::from_qtensor(t("attn_k.weight", &[nkv * hd, hidden])?)?,
-                    wv: QMatMul::from_qtensor(t("attn_v.weight", &[nkv * hd, hidden])?)?,
+                    qkv: QkvProjection::new(
+                        t("attn_q.weight", &[hidden, hidden])?,
+                        t("attn_k.weight", &[nkv * hd, hidden])?,
+                        t("attn_v.weight", &[nkv * hd, hidden])?,
+                    )?,
                     wo: QMatMul::from_qtensor(t("attn_output.weight", &[hidden, hidden])?)?,
                     q_norm: RmsNorm::from_qtensor(t("attn_q_norm.weight", &[hd])?, eps)?,
                     k_norm: RmsNorm::from_qtensor(t("attn_k_norm.weight", &[hd])?, eps)?,
@@ -753,5 +835,74 @@ mod tests {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod qkv_tests {
+    use super::*;
+    use candle::quantized::GgmlDType;
+    fn check(device: &Device) -> Result<()> {
+        // Q/K share formats in our GGUF; V is Q6K in two attention layers.
+        for types in [
+            [GgmlDType::Q5K; 3],
+            [GgmlDType::Q5K, GgmlDType::Q5K, GgmlDType::Q6K],
+            [GgmlDType::Q5K, GgmlDType::Q6K, GgmlDType::Q5K],
+        ] {
+            let rows = [1024, 512, 512];
+            let mut weights = Vec::new();
+            let mut separate = Vec::new();
+            for (i, &n) in rows.iter().enumerate() {
+                let data = Tensor::from_vec(
+                    (0..n * 512)
+                        .map(|j| ((j + i * 331) as f32 / 113.).sin())
+                        .collect::<Vec<_>>(),
+                    (n, 512),
+                    &Device::Cpu,
+                )?;
+                let w = QTensor::quantize_onto(&data, types[i], device)?;
+                separate.push(QMatMul::from_qtensor(QTensor::quantize_onto(
+                    &data, types[i], device,
+                )?)?);
+                weights.push(w);
+            }
+            let v = weights.pop().unwrap();
+            let k = weights.pop().unwrap();
+            let q = weights.pop().unwrap();
+            let joined = QkvProjection::new(q, k, v)?;
+            for seq in [1, 3, 17] {
+                let x = Tensor::from_vec(
+                    (0..seq * 512)
+                        .map(|i| (i as f32 / 71.).cos())
+                        .collect::<Vec<_>>(),
+                    (1, seq, 512),
+                    device,
+                )?;
+                let (q, k, v) = joined.forward(&x)?;
+                for (i, out) in [q, k, v].into_iter().enumerate() {
+                    assert_eq!(out.dims(), [1, seq, rows[i]]);
+                    let expected = separate[i].forward(&x)?.flatten_all()?.to_vec1::<f32>()?;
+                    let got = out.flatten_all()?.to_vec1::<f32>()?;
+                    let scale = expected.iter().fold(1e-6f32, |m, v| m.max(v.abs()));
+                    for (a, b) in got.iter().zip(&expected) {
+                        assert!(
+                            (a - b).abs() < 2e-5 * scale,
+                            "{types:?} seq={seq} projection={i}: {a} vs {b}"
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+    #[test]
+    fn qkv_bundle_matches_independent_projections_cpu() -> Result<()> {
+        check(&Device::Cpu)
+    }
+    #[test]
+    #[cfg(feature = "rocm")]
+    #[ignore = "requires ROCm GPU; device failure is an error"]
+    fn qkv_bundle_matches_independent_projections_rocm() -> Result<()> {
+        check(&Device::new_rocm(0)?)
     }
 }
