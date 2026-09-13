@@ -320,8 +320,8 @@ impl QRocmStorage {
 
     /// `self` is a `(num_experts, n, k)` stack of expert weight matrices.
     ///
-    /// See [`moe`] — the kernels are the MMVQ ones with the expert index folded
-    /// into the weight pointer.
+    /// See [`moe`]: small batches use indexed MMVQ; Q5K/Q6K prefill groups
+    /// routed pairs by expert and reuses MMQ tiles with indirect columns.
     pub fn indexed_moe_forward(
         &self,
         self_shape: &Shape,

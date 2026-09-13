@@ -1,17 +1,24 @@
-//! Indexed mixture-of-experts forward: one quantized mat-vec per routed pair.
+//! Indexed MoE: grouped quantized matmul for prefill, matvec for small batches.
 //!
 //! The weights are a single `(num_experts, n, k)` quantized tensor; `ids` picks
-//! which expert each of the `batch * topk` routed tokens goes to. The kernel is
-//! `indexed_moe_forward_*_q8_1` in `candle-kernels/src/quantized.cu` — the same
+//! which expert each of the `batch * topk` routed tokens goes to.
+//! For small batches, `indexed_moe_forward_*_q8_1` in
+//! `candle-kernels/src/quantized.cu` uses the same
 //! `vec_dot_q*_q8_1` inner loop [`super::mmvq`] uses, with the expert index
 //! folded into the weight pointer, so it inherits MMVQ's `q8_1` activation
 //! requantization wholesale (see [`super::q8_1`]).
 //!
-//! Mirrors `quantized/cuda.rs::indexed_moe_forward_fused_q8_1_input`.
+//! Q5K/Q6K prefill with at least eight routed columns per expert instead
+//! groups pairs on the GPU and runs shared MMQ tiles with indirect input/output
+//! columns. Its Q5 minimum correction retains the vector path's quantized sums.
+//! Only expert counts/status cross to the host; weights/activations stay resident.
+//!
+//! Vector path mirrors `quantized/cuda.rs::indexed_moe_forward_fused_q8_1_input`.
 
 use super::kernels::{arg, launch_err, MATRIX_ROW_PADDING, WARP_SIZE};
 use super::q8_1::{buffer_bytes, pad, quantize_q8_1};
 use super::QRocmStorage;
+use crate::backend::BackendDevice;
 use crate::quantized::GgmlDType;
 use crate::rocm_backend::rocm_rs::hip::Dim3;
 use crate::rocm_backend::{kernels, RocmStorage, RocmStorageSlice};
@@ -70,7 +77,7 @@ fn dims(self_shape: &Shape, input_l: &Layout, ids_l: &Layout) -> Result<Dims> {
     if input_dim1 != 1 && input_dim1 != topk {
         crate::bail!("indexed_moe_forward: input dim 1 is {input_dim1}, expected 1 or topk {topk}")
     }
-    if topk == 0 || batch == 0 || n == 0 || k == 0 {
+    if num_experts == 0 || topk == 0 || batch == 0 || n == 0 || k == 0 {
         crate::bail!(
             "indexed_moe_forward: empty shape {self_shape:?} / {:?}",
             ids_l.shape()
@@ -96,6 +103,24 @@ pub(super) fn forward(
     ids: &RocmStorage,
     ids_l: &Layout,
 ) -> Result<(RocmStorage, Shape)> {
+    forward_impl(q, self_shape, input, input_l, ids, ids_l, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn forward_impl(
+    q: &QRocmStorage,
+    self_shape: &Shape,
+    input: &RocmStorage,
+    input_l: &Layout,
+    ids: &RocmStorage,
+    ids_l: &Layout,
+    grouped_override: Option<bool>,
+) -> Result<(RocmStorage, Shape)> {
+    if !q.device.same_device(&input.device) || !q.device.same_device(&ids.device) {
+        crate::bail!(
+            "indexed_moe_forward: weights, input and ids must share the same ROCm device/stream"
+        )
+    }
     let name = match kernel_name(q.dtype) {
         Some(name) => name,
         None => crate::bail!(
@@ -112,6 +137,18 @@ pub(super) fn forward(
             q.dtype,
             q.dtype.block_size()
         )
+    }
+    // Both MMVQ and MMQ use signed 32-bit local indexing. Reject shapes
+    // outside that contract before casting dimensions or allocating scratch.
+    for factors in [
+        [d.num_experts, d.n, d.k],
+        [d.batch, d.topk, d.n],
+        [d.batch, d.input_dim1, pad(d.k, MATRIX_ROW_PADDING)],
+    ] {
+        let count = factors.iter().try_fold(1usize, |n, x| n.checked_mul(*x));
+        if !matches!(count, Some(n) if n <= i32::MAX as usize) {
+            crate::bail!("indexed_moe_forward: shape exceeds 32-bit kernel indexing")
+        }
     }
     // The kernel strides between experts by `n * k / block_size` blocks with no
     // bound of its own, so a short payload would read past the allocation.
@@ -153,6 +190,17 @@ pub(super) fn forward(
     quantize_q8_1(y, y_offset, &input_q8_1, d.k, total_rows, dev)?;
 
     let out = dev.alloc_zeros::<f32>(d.batch * d.topk * d.n)?;
+    let grouped = grouped_override.unwrap_or_else(|| use_grouped(q.dtype, &d));
+    if grouped {
+        grouped_forward(q, &d, &input_q8_1, ids_mem, ids_offset, &out)?;
+        return Ok((
+            RocmStorage {
+                slice: RocmStorageSlice::F32(out),
+                device: dev.clone(),
+            },
+            (d.batch, d.topk, d.n).into(),
+        ));
+    }
     let func = dev.get_or_load_func(name, &kernels::QUANTIZED)?;
 
     let w_ptr = q.data.as_ptr();
@@ -198,6 +246,153 @@ pub(super) fn forward(
         },
         (d.batch, d.topk, d.n).into(),
     ))
+}
+
+// Keep decode and short/sparse suffixes on the vector path. Eight routed
+// columns per expert is a conservative starting point; this is a dispatch
+// rule, never a retry after a grouped-kernel failure.
+fn use_grouped(dtype: GgmlDType, d: &Dims) -> bool {
+    matches!(dtype, GgmlDType::Q5K | GgmlDType::Q6K)
+        && d.batch > 1
+        && d.batch * d.topk / d.num_experts >= 8
+        && super::mmq::supports(dtype, d.k)
+}
+
+fn grouped_forward(
+    q: &QRocmStorage,
+    d: &Dims,
+    input_q8: &crate::rocm_backend::SendSyncDeviceMemory<u8>,
+    ids: &crate::rocm_backend::SendSyncDeviceMemory<u32>,
+    ids_offset: usize,
+    out: &crate::rocm_backend::SendSyncDeviceMemory<f32>,
+) -> Result<()> {
+    let name = match q.dtype {
+        GgmlDType::Q5K => "grouped_mul_mat_q5_K",
+        GgmlDType::Q6K => "grouped_mul_mat_q6_K",
+        _ => crate::bail!("grouped MoE requires Q5K or Q6K weights"),
+    };
+    if !super::mmq::supports(q.dtype, d.k) || d.num_experts > 65535 {
+        crate::bail!("unsupported grouped MoE dimensions")
+    }
+    let dev = &q.device;
+    let plan = super::mmq::plan(q.dtype, dev.mmq_tiles())
+        .ok_or_else(|| crate::Error::Msg("missing grouped MoE tile geometry".into()))?;
+    let total_pairs = d.batch * d.topk;
+    let scratch_len = d
+        .num_experts
+        .checked_mul(total_pairs)
+        .ok_or_else(|| crate::Error::Msg("grouped MoE routing scratch overflow".into()))?;
+    let pairs = dev.alloc_zeros::<u32>(scratch_len)?;
+    let counts = dev.alloc_zeros::<u32>(d.num_experts + 1)?;
+    // Input/ID offsets have been checked against their contiguous layouts.
+    let ids_ptr = unsafe { ids.ptr_at(ids_offset) };
+    let pairs_ptr = pairs.as_ptr();
+    let counts_ptr = counts.as_ptr();
+    let total_i = total_pairs as i32;
+    let experts_i = d.num_experts as i32;
+    let mut args = vec![
+        arg(&ids_ptr),
+        arg(&pairs_ptr),
+        arg(&counts_ptr),
+        arg(&total_i),
+        arg(&experts_i),
+    ];
+    let func = dev.get_or_load_func("moe_group_pairs", &kernels::QUANTIZED)?;
+    func.launch(
+        Dim3::new_1d(d.num_experts as u32),
+        Dim3::new_1d(256),
+        0,
+        Some(dev.stream()),
+        &mut args,
+    )
+    .map_err(|e| launch_err("moe_group_pairs", e))?;
+    // A small metadata readback (33 u32 for LFM2.5), not the routing tensor.
+    // clone_dtoh synchronizes the owning stream. This makes invalid IDs an
+    // explicit error before any weight reads and bounds the column grid to
+    // the busiest expert, including duplicate routes within the same token.
+    let host_counts = dev.clone_dtoh(&counts)?;
+    if host_counts[d.num_experts] != 0 {
+        crate::bail!("grouped MoE: expert id is outside the weight stack")
+    }
+    let accounted: u64 = host_counts[..d.num_experts].iter().map(|n| *n as u64).sum();
+    if accounted != total_pairs as u64 {
+        crate::bail!("grouped MoE routing counts do not account for every pair")
+    }
+    let max_count = *host_counts[..d.num_experts].iter().max().unwrap() as usize;
+    if max_count == 0 {
+        crate::bail!("grouped MoE produced no routed pairs")
+    }
+    if max_count.div_ceil(plan.mmq_x) > 65535 {
+        crate::bail!("grouped MoE column grid exceeds HIP limit")
+    }
+    let w_ptr = q.data.as_ptr();
+    let y_ptr = input_q8.as_ptr();
+    let out_ptr = out.as_ptr();
+    let n_i = d.n as i32;
+    let k_i = d.k as i32;
+    let k_padded_i = pad(d.k, MATRIX_ROW_PADDING) as i32;
+    let topk_i = d.topk as i32;
+    let input_dim1_i = d.input_dim1 as i32;
+    let mut args = vec![
+        arg(&w_ptr),
+        arg(&y_ptr),
+        arg(&out_ptr),
+        arg(&pairs_ptr),
+        arg(&counts_ptr),
+        arg(&n_i),
+        arg(&k_i),
+        arg(&k_padded_i),
+        arg(&total_i),
+        arg(&topk_i),
+        arg(&input_dim1_i),
+    ];
+    let func = dev.get_or_load_func(name, &kernels::QUANTIZED)?;
+    func.launch(
+        Dim3::new_3d(
+            d.n.div_ceil(plan.mmq_y) as u32,
+            max_count.div_ceil(plan.mmq_x) as u32,
+            d.num_experts as u32,
+        ),
+        Dim3::new_2d(WARP_SIZE as u32, plan.nwarps as u32),
+        0,
+        Some(dev.stream()),
+        &mut args,
+    )
+    .map_err(|e| launch_err(name, e))?;
+    Ok(())
+}
+
+#[cfg(test)]
+fn forward_for_test(
+    w: &crate::quantized::QTensor,
+    x: &crate::Tensor,
+    ids: &crate::Tensor,
+    grouped: bool,
+) -> Result<crate::Tensor> {
+    match (&w.storage, &*x.storage(), &*ids.storage()) {
+        (
+            crate::quantized::QStorage::Rocm(q),
+            crate::Storage::Rocm(x_s),
+            crate::Storage::Rocm(ids_s),
+        ) => {
+            let (out, shape) = forward_impl(
+                q,
+                w.shape(),
+                x_s,
+                x.layout(),
+                ids_s,
+                ids.layout(),
+                Some(grouped),
+            )?;
+            Ok(crate::tensor::from_storage(
+                crate::Storage::Rocm(out),
+                shape,
+                crate::op::BackpropOp::none(),
+                false,
+            ))
+        }
+        _ => crate::bail!("test expects ROCm weights and tensors"),
+    }
 }
 
 #[cfg(test)]

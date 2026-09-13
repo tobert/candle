@@ -468,10 +468,11 @@ static_assert(sizeof(block_q8_K) == sizeof(float) + QK_K + QK_K/16*sizeof(int16_
 
 
 template <int qk, int qr, int qi, bool need_sum, typename block_q_t, int mmq_x, int mmq_y, int nwarps,
-              allocate_tiles_cuda_t allocate_tiles, load_tiles_cuda_t load_tiles, int vdr, vec_dot_q_mul_mat_cuda_t vec_dot>
+              allocate_tiles_cuda_t allocate_tiles, load_tiles_cuda_t load_tiles, int vdr, vec_dot_q_mul_mat_cuda_t vec_dot, bool indexed = false>
 static __device__ __forceinline__ void mul_mat_q(
     const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
-    const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y, const int nrows_dst) {
+    const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y, const int nrows_dst,
+    const uint32_t * __restrict__ routed_pairs = nullptr, const int topk = 1, const int input_dim1 = 1) {
 
     const block_q_t  * x = (const block_q_t  *) vx;
     const block_q8_1 * y = (const block_q8_1 *) vy;
@@ -512,7 +513,11 @@ static __device__ __forceinline__ void mul_mat_q(
 
 #pragma unroll
             for (int i = 0; i < mmq_x; i += nwarps) {
-                const int col_y_eff = min(col_y_0 + threadIdx.y + i, ncols_y-1); // to prevent out-of-bounds memory accesses
+                int col_y_eff = min(col_y_0 + threadIdx.y + i, ncols_y-1);
+                if (indexed) {
+                    const uint32_t pair = routed_pairs[col_y_eff];
+                    col_y_eff = input_dim1 == 1 ? pair / topk : pair;
+                }
 
                 const block_q8_1 * by0 = &y[col_y_eff*blocks_per_col_y + ib0 * (qk/QK8_1) + kbxd];
 
@@ -524,7 +529,11 @@ static __device__ __forceinline__ void mul_mat_q(
             for (int ids0 = 0; ids0 < mmq_x; ids0 += nwarps * QI8_1) {
                 const int ids = (ids0 + threadIdx.y * QI8_1 + threadIdx.x / (WARP_SIZE/QI8_1)) % mmq_x;
                 const int kby = threadIdx.x % (WARP_SIZE/QI8_1);
-                const int col_y_eff = min(col_y_0 + ids, ncols_y-1);
+                int col_y_eff = min(col_y_0 + ids, ncols_y-1);
+                if (indexed) {
+                    const uint32_t pair = routed_pairs[col_y_eff];
+                    col_y_eff = input_dim1 == 1 ? pair / topk : pair;
+                }
 
                 // if the sum is not needed it's faster to transform the scale to f32 ahead of time
                 const half2 * dsi_src = &y[col_y_eff*blocks_per_col_y + ib0 * (qk/QK8_1) + ir*(WARP_SIZE/QI8_1) + kby].ds;
@@ -572,7 +581,7 @@ static __device__ __forceinline__ void mul_mat_q(
                 continue;
             }
 
-            dst[col_dst*nrows_dst + row_dst] = sum[i/WARP_SIZE][j/nwarps];
+            dst[(indexed ? (size_t) routed_pairs[col_dst] : (size_t) col_dst)*nrows_dst + row_dst] = sum[i/WARP_SIZE][j/nwarps];
         }
     }
 }
@@ -2541,27 +2550,35 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1_impl_vmmq(
     return dm5f.x*sumf_d - dm5f.y*sumf_m;
 }
 
-// contiguous u/y values
+// Dense MMQ uses the saved original activation sum. Indexed MoE historically
+// computes the minimum correction from the quantized activation bytes instead;
+// keep that arithmetic for grouped MoE so prefill doesn't change this policy.
+template <bool quantized_sum = false>
 static __device__ __forceinline__ float vec_dot_q5_K_q8_1_impl_mmq(
     const int * __restrict__ v, const int * __restrict__ u, const uint8_t * __restrict__ sc,
     const uint8_t * __restrict__ m, const half2 & dm4, const half2 * __restrict__ ds8) {
 
+    static_assert(4*QI8_1 == QK8_1, "Q5 minimum correction must span one q8 block");
     float sumf_d = 0.0f;
     float sumf_m = 0.0f;
 
 #pragma unroll
     for (int i = 0; i < QR5_K*VDR_Q5_K_Q8_1_MMQ/QI8_1; ++i) {
         int sumi_d = 0;
+        int sumi_m = 0;
 
 #pragma unroll
         for (int j = 0; j < QI8_1; ++j) {
             sumi_d = ggml_cuda_dp4a(v[i*QI8_1 + j], u[i*QI8_1 + j], sumi_d); // SIMD dot product
+            if (quantized_sum) {
+                sumi_m = ggml_cuda_dp4a(0x01010101, u[i*QI8_1 + j], sumi_m);
+            }
         }
 
         const float2 ds8f = __half22float2(ds8[i]);
 
         sumf_d += ds8f.x * (sc[i] * sumi_d);
-        sumf_m += ds8f.y *   m[i]; // sum of q8_1 block * q4_K min val
+        sumf_m += quantized_sum ? ds8f.x * (sumi_m * m[i]) : ds8f.y * m[i];
     }
 
     const float2 dm4f = __half22float2(dm4);
@@ -4401,6 +4418,7 @@ template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinlin
     }
 }
 
+template <bool quantized_sum = false>
 static __device__ __forceinline__ float vec_dot_q5_K_q8_1_mul_mat(
     const int * __restrict__ x_ql, const half2 * __restrict__ x_dm, const int * __restrict__ x_qh, const int * __restrict__ x_sc,
     const int * __restrict__ y_qs, const half2 * __restrict__ y_ds, const int & i, const int & j, const int & k) {
@@ -4410,7 +4428,7 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1_mul_mat(
 
     const int index_x = i * (QR5_K*WARP_SIZE + 1) +  QR5_K*k;
     const int index_y = j * WARP_SIZE             + (QR5_K*k) % WARP_SIZE;
-    return vec_dot_q5_K_q8_1_impl_mmq(&x_ql[index_x], &y_qs[index_y], sc, sc+8,
+    return vec_dot_q5_K_q8_1_impl_mmq<quantized_sum>(&x_ql[index_x], &y_qs[index_y], sc, sc+8,
                                       x_dm[i * (WARP_SIZE/QI5_K) + i/QI5_K], &y_ds[index_y/QI8_1]);
 }
 
@@ -4665,7 +4683,7 @@ mul_mat_q5_K(
     const int mmq_y  =  MMQ_Y_OF(Q5_K);
     const int nwarps = NWARPS_OF(Q5_K);
     mul_mat_q<QK_K, QR5_K, QI5_K, true, block_q5_K, mmq_x, mmq_y, nwarps, allocate_tiles_q5_K<mmq_y>,
-        load_tiles_q5_K<mmq_y, nwarps, true>, VDR_Q5_K_Q8_1_MMQ, vec_dot_q5_K_q8_1_mul_mat>
+        load_tiles_q5_K<mmq_y, nwarps, true>, VDR_Q5_K_Q8_1_MMQ, vec_dot_q5_K_q8_1_mul_mat<false>>
         (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
 }
 
@@ -4679,6 +4697,60 @@ extern "C" __global__ void MMQ_LAUNCH_BOUNDS(Q6_K)
     mul_mat_q<QK_K, QR6_K, QI6_K, false, block_q6_K, mmq_x, mmq_y, nwarps, allocate_tiles_q6_K<mmq_y>,
         load_tiles_q6_K<mmq_y, nwarps, true>, VDR_Q6_K_Q8_1_MMQ, vec_dot_q6_K_q8_1_mul_mat>
         (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+}
+
+// Pack routed pairs by expert. Every pair is retained, including repeated IDs
+// within a token. Counts have an extra last entry for invalid-ID status. The
+// host checks that status before launching a kernel which dereferences weights.
+extern "C" __global__ void moe_group_pairs(
+    const uint32_t * __restrict__ ids, uint32_t * __restrict__ pairs,
+    uint32_t * __restrict__ counts, const int total_pairs, const int experts) {
+    const int expert = blockIdx.x;
+    for (int pair = threadIdx.x; pair < total_pairs; pair += blockDim.x) {
+        const uint32_t id = ids[pair];
+        if (expert == 0 && id >= (uint32_t) experts) {
+            atomicExch(&counts[experts], 1u);
+        }
+        if (id == (uint32_t) expert) {
+            const uint32_t slot = atomicAdd(&counts[expert], 1u);
+            pairs[(size_t) expert*total_pairs + slot] = pair;
+        }
+    }
+}
+
+// Reuse the dense MMQ tiles with indirect activation loads and output stores.
+// The arithmetic is identical to MMQ; only the column mapping changes. Empty
+// experts and excess column tiles exit uniformly before any shared barriers.
+extern "C" __global__ void MMQ_LAUNCH_BOUNDS(Q5_K) grouped_mul_mat_q5_K(
+    const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
+    const uint32_t * __restrict__ pairs, const uint32_t * __restrict__ counts,
+    const int n, const int k, const int k_padded, const int total_pairs,
+    const int topk, const int input_dim1) {
+    const int expert = blockIdx.z;
+    const int count = counts[expert];
+    const int mmq_x = MMQ_X_OF(Q5_K), mmq_y = MMQ_Y_OF(Q5_K), nwarps = NWARPS_OF(Q5_K);
+    if (blockIdx.y*mmq_x >= (uint32_t) count) return;
+    const block_q5_K * weights = (const block_q5_K *) vx + (size_t) expert*n*(k/QK_K);
+    mul_mat_q<QK_K, QR5_K, QI5_K, true, block_q5_K, mmq_x, mmq_y, nwarps,
+        allocate_tiles_q5_K<mmq_y>, load_tiles_q5_K<mmq_y, nwarps, true>,
+        VDR_Q5_K_Q8_1_MMQ, vec_dot_q5_K_q8_1_mul_mat<true>, true>(
+        weights, vy, dst, k, n, count, k_padded, n, pairs + (size_t) expert*total_pairs, topk, input_dim1);
+}
+
+extern "C" __global__ void MMQ_LAUNCH_BOUNDS(Q6_K) grouped_mul_mat_q6_K(
+    const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
+    const uint32_t * __restrict__ pairs, const uint32_t * __restrict__ counts,
+    const int n, const int k, const int k_padded, const int total_pairs,
+    const int topk, const int input_dim1) {
+    const int expert = blockIdx.z;
+    const int count = counts[expert];
+    const int mmq_x = MMQ_X_OF(Q6_K), mmq_y = MMQ_Y_OF(Q6_K), nwarps = NWARPS_OF(Q6_K);
+    if (blockIdx.y*mmq_x >= (uint32_t) count) return;
+    const block_q6_K * weights = (const block_q6_K *) vx + (size_t) expert*n*(k/QK_K);
+    mul_mat_q<QK_K, QR6_K, QI6_K, false, block_q6_K, mmq_x, mmq_y, nwarps,
+        allocate_tiles_q6_K<mmq_y>, load_tiles_q6_K<mmq_y, nwarps, true>,
+        VDR_Q6_K_Q8_1_MMQ, vec_dot_q6_K_q8_1_mul_mat, true>(
+        weights, vy, dst, k, n, count, k_padded, n, pairs + (size_t) expert*total_pairs, topk, input_dim1);
 }
 
 

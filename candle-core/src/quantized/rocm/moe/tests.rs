@@ -188,3 +188,259 @@ fn indexed_moe_rejects_a_mismatched_batch_rocm() -> Result<()> {
     assert!(err.contains("batch"), "unexpected error: {err}");
     Ok(())
 }
+
+// Explicit hardware tests: absence of a GPU is an error, not a passing skip.
+#[test]
+#[ignore = "requires ROCm GPU"]
+fn grouped_moe_matches_cpu_and_individual_routes_rocm() -> Result<()> {
+    let device = Device::new_rocm(0)?;
+    // Partial output/input tiles, padded K stride, duplicate routes, one hot
+    // expert and unused experts. Nonzero input/ID offsets catch pointer bugs.
+    for dtype in [GgmlDType::Q5K, GgmlDType::Q6K] {
+        for (batch, topk, input_dim1, hot) in
+            [(65, 4, 1, false), (33, 4, 4, false), (67, 2, 2, true)]
+        {
+            let (experts, n, k) = (5, 131, 768);
+            let dense =
+                Tensor::from_vec(ramp(experts * n * k, 61.), (experts, n, k), &Device::Cpu)?;
+            let weights = QTensor::quantize_onto(&dense, dtype, &device)?;
+            let w_cpu = QTensor::quantize(&dense, dtype)?.dequantize(&Device::Cpu)?;
+            let input = Tensor::from_vec(
+                ramp((batch + 1) * input_dim1 * k, 43.),
+                (batch + 1, input_dim1, k),
+                &device,
+            )?
+            .narrow(0, 1, batch)?;
+            let ids: Vec<u32> = (0..(batch + 1) * topk)
+                .map(|i| if hot { 3 } else { ((i * 7 + i / 3) % 4) as u32 })
+                .collect();
+            let ids_t =
+                Tensor::from_vec(ids.clone(), (batch + 1, topk), &device)?.narrow(0, 1, batch)?;
+            let got = super::forward_for_test(&weights, &input, &ids_t, true)?
+                .flatten_all()?
+                .to_vec1::<f32>()?;
+            let want = reference(&w_cpu, &input.to_device(&Device::Cpu)?, &ids[topk..], topk)?
+                .flatten_all()?
+                .to_vec1::<f32>()?;
+            // Existing q8_1 activation accuracy contract, evaluated per row.
+            for (actual, expected) in got.chunks(n).zip(want.chunks(n)) {
+                let scale = expected.iter().fold(1e-6f32, |m, v| m.max(v.abs()));
+                for (a, b) in actual.iter().zip(expected) {
+                    assert!(
+                        (a - b).abs() <= 0.02 * scale,
+                        "{dtype:?}: grouped {a} CPU {b}"
+                    );
+                }
+            }
+            // A single-route matvec uses identical activation quantization but
+            // a different accumulation order: compare more tightly than CPU.
+            for pair in [0, topk + 1, batch * topk - 1] {
+                let x = input
+                    .narrow(0, pair / topk, 1)?
+                    .narrow(1, if input_dim1 == 1 { 0 } else { pair % topk }, 1)?
+                    .contiguous()?;
+                let id = Tensor::from_vec(vec![ids[topk + pair]], (1, 1), &device)?;
+                let old = weights
+                    .indexed_moe_forward(&x, &id)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?;
+                let scale = old.iter().fold(1e-6f32, |m, v| m.max(v.abs()));
+                for (a, b) in got[pair * n..(pair + 1) * n].iter().zip(&old) {
+                    assert!(
+                        (a - b).abs() <= 2e-5 * scale,
+                        "{dtype:?}: grouped {a} matvec {b}"
+                    );
+                }
+            }
+            let again = super::forward_for_test(&weights, &input, &ids_t, true)?
+                .flatten_all()?
+                .to_vec1::<f32>()?;
+            assert_eq!(got, again, "route packing must not affect arithmetic");
+            let dispatched = weights
+                .indexed_moe_forward(&input, &ids_t)?
+                .flatten_all()?
+                .to_vec1::<f32>()?;
+            assert_eq!(
+                got, dispatched,
+                "public dispatch must reach grouped arithmetic"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires ROCm GPU"]
+fn grouped_moe_rejects_invalid_expert_ids_rocm() -> Result<()> {
+    let device = Device::new_rocm(0)?;
+    let dense = Tensor::zeros((2, 32, 256), crate::DType::F32, &device)?;
+    let w = QTensor::quantize(&dense, GgmlDType::Q5K)?;
+    let x = Tensor::zeros((16, 1, 256), crate::DType::F32, &device)?;
+    for invalid in [2, u32::MAX] {
+        let mut ids = vec![0u32; 32];
+        ids[31] = invalid;
+        let ids = Tensor::from_vec(ids, (16, 2), &device)?;
+        let error = super::forward_for_test(&w, &x, &ids, true)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("expert id"), "{error}");
+    }
+    Ok(())
+}
+
+#[test]
+fn grouped_moe_dispatch_keeps_decode_and_sparse_suffixes_on_matvec() {
+    let mut d = super::Dims {
+        num_experts: 32,
+        n: 3584,
+        k: 2048,
+        batch: 1,
+        topk: 4,
+        input_dim1: 1,
+    };
+    assert!(!super::use_grouped(GgmlDType::Q5K, &d));
+    d.batch = 63;
+    assert!(!super::use_grouped(GgmlDType::Q5K, &d));
+    d.batch = 64;
+    assert!(super::use_grouped(GgmlDType::Q5K, &d));
+    assert!(super::use_grouped(GgmlDType::Q6K, &d));
+    assert!(!super::use_grouped(GgmlDType::Q4K, &d));
+    d.k = 257;
+    assert!(!super::use_grouped(GgmlDType::Q5K, &d));
+}
+
+/// Wall-clock dispatch comparison, not a profiler. Both paths include their
+/// own activation quantization, allocations, routing and synchronization.
+#[test]
+#[ignore = "manual timing run on ROCm GPU"]
+fn bench_grouped_moe_lfm25_rocm() -> Result<()> {
+    let dev = Device::new_rocm(0)?;
+    for (dtype, n, k, slots) in [
+        (GgmlDType::Q5K, 3584, 2048, 1),
+        (GgmlDType::Q6K, 2048, 1792, 4),
+    ] {
+        let dense = Tensor::from_vec(ramp(32 * n * k, 61.), (32, n, k), &Device::Cpu)?;
+        let weights = QTensor::quantize_onto(&dense, dtype, &dev)?;
+        for batch in [32, 64, 128] {
+            let input = Tensor::from_vec(ramp(batch * slots * k, 43.), (batch, slots, k), &dev)?;
+            let ids = Tensor::from_vec(
+                (0..batch * 4)
+                    .map(|i| ((i * 7 + i / 5) % 32) as u32)
+                    .collect::<Vec<_>>(),
+                (batch, 4),
+                &dev,
+            )?;
+            let mut times = [Vec::new(), Vec::new()];
+            for round in 0..7 {
+                // Alternate ordering; first pair warms kernels/allocator.
+                for grouped in if round % 2 == 0 {
+                    [false, true]
+                } else {
+                    [true, false]
+                } {
+                    dev.synchronize()?;
+                    let start = std::time::Instant::now();
+                    let out = super::forward_for_test(&weights, &input, &ids, grouped)?;
+                    dev.synchronize()?;
+                    let elapsed = start.elapsed().as_secs_f64() * 1000.;
+                    std::hint::black_box(out);
+                    if round > 0 {
+                        times[usize::from(grouped)].push(elapsed);
+                    }
+                }
+            }
+            for t in &mut times {
+                t.sort_by(f64::total_cmp);
+            }
+            let old = (times[0][2] + times[0][3]) / 2.;
+            let new = (times[1][2] + times[1][3]) / 2.;
+            println!("GROUPED_TIMING dtype={dtype:?} n={n} k={k} batch={batch} matvec_ms={old:.4} grouped_ms={new:.4} speedup={:.3}",old/new);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires ROCm GPU"]
+fn grouped_moe_rejects_invalid_layouts_rocm() -> Result<()> {
+    let dev = Device::new_rocm(0)?;
+    let dense = Tensor::zeros((2, 32, 256), crate::DType::F32, &dev)?;
+    let w = QTensor::quantize(&dense, GgmlDType::Q5K)?;
+    let x = Tensor::zeros((16, 1, 256), crate::DType::F32, &dev)?;
+    let ids = Tensor::zeros((16, 2), crate::DType::U32, &dev)?;
+    let strided = Tensor::zeros((16, 1, 512), crate::DType::F32, &dev)?.narrow(2, 0, 256)?;
+    let strided_ids = Tensor::zeros((16, 4), crate::DType::U32, &dev)?.narrow(1, 0, 2)?;
+    for (input, routes, expected) in [
+        (strided, ids.clone(), "contiguous input"),
+        (x.clone(), strided_ids, "contiguous u32 ids"),
+        (x.to_dtype(crate::DType::F16)?, ids.clone(), "f32 input"),
+        (x.clone(), ids.to_dtype(crate::DType::I64)?, "u32 ids"),
+        (x.narrow(0, 0, 0)?, ids.narrow(0, 0, 0)?, "empty shape"),
+    ] {
+        let err = super::forward_for_test(&w, &input, &routes, true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(expected), "{err}");
+    }
+    // Same physical GPU but a different Candle device owns a different stream.
+    let other = Device::new_rocm(0)?;
+    let other_x = Tensor::zeros((16, 1, 256), crate::DType::F32, &other)?;
+    let err = w
+        .indexed_moe_forward(&other_x, &ids)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("same ROCm device/stream"), "{err}");
+    Ok(())
+}
+
+// Isolate Q5's minimum term: zero quantized weights, nonzero per-block minima,
+// and activations whose original sum differs strongly from d*sum(q8).
+#[test]
+#[ignore = "requires ROCm GPU"]
+fn grouped_moe_q5_minimum_uses_quantized_activation_sum_rocm() -> Result<()> {
+    use crate::quantized::k_quants::BlockQ5K;
+    use half::f16;
+    let dev = Device::new_rocm(0)?;
+    let Device::Rocm(gpu) = &dev else {
+        unreachable!()
+    };
+    let block = BlockQ5K {
+        d: f16::from_f32(0.5),
+        dmin: f16::from_f32(0.25),
+        // sc=1 for all groups; minima=1..8 in the GGML packed 6-bit layout.
+        scales: [1, 1, 1, 1, 1, 2, 3, 4, 0x51, 0x61, 0x71, 0x81],
+        qh: [0; 32],
+        qs: [0; 128],
+    };
+    let w = QTensor::new(
+        crate::quantized::rocm::load_quantized(gpu, &[block])?,
+        (1, 1, 256),
+    )?;
+    for sign in [-1f32, 0., 1.] {
+        let mut row = Vec::new();
+        let mut expected = 0f32;
+        let mut original_sum_result = 0f32;
+        for group in 1..=8 {
+            let amplitude = group as f32;
+            let scale = f16::from_f32(amplitude / 127.).to_f32();
+            expected -= 0.25 * amplitude * sign * 127. * scale;
+            for i in 0..32 {
+                let value = sign * amplitude * if i == 0 { 1. } else { 0.49 / 127. };
+                row.push(value);
+                original_sum_result -= 0.25 * amplitude * value;
+            }
+        }
+        if sign != 0. {
+            assert!((expected - original_sum_result).abs() > 1.);
+        }
+        let x = Tensor::from_vec(row.repeat(16), (16, 1, 256), &dev)?;
+        let ids = Tensor::zeros((16, 1), crate::DType::U32, &dev)?;
+        let got = super::forward_for_test(&w, &x, &ids, true)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        for value in got {
+            assert!((value-expected).abs()<=2e-5*expected.abs().max(1.),"got {value}, quantized-sum reference {expected}, original-sum result {original_sum_result}");
+        }
+    }
+    Ok(())
+}

@@ -61,14 +61,14 @@ fn kernel(dtype: GgmlDType) -> Option<(&'static str, usize)> {
 /// `k_step` is per *architecture* as well as per dtype: `quantized.cu` carries
 /// one tile set per architecture and the host has to launch whichever the
 /// kernel was compiled with.
-struct Plan {
+pub(super) struct Plan {
     name: &'static str,
     /// Output columns per workgroup (`MMQ_X_*`).
-    mmq_x: usize,
+    pub(super) mmq_x: usize,
     /// Output rows per workgroup (`MMQ_Y_*`).
-    mmq_y: usize,
+    pub(super) mmq_y: usize,
     /// Warps per workgroup (`NWARPS_*`), and so the y-extent of the block.
-    nwarps: usize,
+    pub(super) nwarps: usize,
     /// See [`kernel`].
     k_step: usize,
 }
@@ -78,7 +78,7 @@ struct Plan {
 ///
 /// `nwarps` is uniform within a set — 4 for every `NWARPS_*_AMPERE`, 8 for every
 /// `NWARPS_*_RDNA2` — so it is not tabulated per dtype.
-fn plan(dtype: GgmlDType, tiles: MmqTiles) -> Option<Plan> {
+pub(super) fn plan(dtype: GgmlDType, tiles: MmqTiles) -> Option<Plan> {
     let (name, k_step) = kernel(dtype)?;
     let (mmq_x, mmq_y) = match tiles {
         MmqTiles::Ampere => match dtype {
