@@ -622,6 +622,78 @@ impl QTensor {
         })
     }
 
+    /// Concatenate complete packed rows without dequantizing or requantizing.
+    /// The last (block-quantized) axis cannot be concatenated. All inputs must
+    /// have matching rank, dtype, device and non-concatenated dimensions.
+    /// This is a load-time operation: GPU payloads are staged through host RAM.
+    pub fn cat(tensors: &[&Self], dim: usize) -> Result<Self> {
+        let first = tensors
+            .first()
+            .ok_or_else(|| crate::Error::Msg("empty quantized concatenation".into()))?;
+        let dims = first.shape().dims();
+        if dims.len() < 2 || dim >= dims.len() - 1 {
+            crate::bail!("quantized concatenation must preserve the last axis")
+        }
+        let dtype = first.dtype();
+        let device = first.device();
+        let mut shape = dims.to_vec();
+        shape[dim] = 0;
+        let product = |v: &[usize]| -> Result<usize> {
+            v.iter().try_fold(1usize, |a, &b| {
+                a.checked_mul(b).ok_or_else(|| {
+                    crate::Error::Msg("quantized concatenation size overflow".into())
+                })
+            })
+        };
+        let outer = product(&dims[..dim])?;
+        let mut chunks = Vec::new();
+        let mut total_bytes = 0usize;
+        for t in tensors {
+            let ds = t.shape().dims();
+            if ds.len() != dims.len()
+                || t.dtype() != dtype
+                || !t.device().same_device(&device)
+                || ds
+                    .iter()
+                    .zip(dims)
+                    .enumerate()
+                    .any(|(i, (a, b))| i != dim && a != b)
+            {
+                crate::bail!("incompatible packed tensors for concatenation")
+            }
+            shape[dim] = shape[dim]
+                .checked_add(ds[dim])
+                .ok_or_else(|| crate::Error::Msg("quantized concatenation axis overflow".into()))?;
+            let elems = product(&ds[dim..])?;
+            let bytes = (elems / dtype.block_size())
+                .checked_mul(dtype.type_size())
+                .ok_or_else(|| {
+                    crate::Error::Msg("quantized concatenation byte size overflow".into())
+                })?;
+            let expected = outer.checked_mul(bytes).ok_or_else(|| {
+                crate::Error::Msg("quantized concatenation byte size overflow".into())
+            })?;
+            let data = t.data()?;
+            if data.len() != expected {
+                crate::bail!("quantized tensor payload does not match its shape")
+            }
+            total_bytes = total_bytes.checked_add(expected).ok_or_else(|| {
+                crate::Error::Msg("quantized concatenation byte size overflow".into())
+            })?;
+            chunks.push((data, bytes));
+        }
+        let mut data = Vec::with_capacity(total_bytes);
+        for i in 0..outer {
+            for (src, bytes) in &chunks {
+                data.extend_from_slice(&src[i * bytes..(i + 1) * bytes]);
+            }
+        }
+        Self::new(
+            QStorage::from_data(Cow::Owned(data), &device, dtype)?,
+            shape,
+        )
+    }
+
     pub fn quantize(src: &Tensor, dtype: GgmlDType) -> Result<Self> {
         let shape = src.shape();
         let block_size = dtype.block_size();

@@ -101,13 +101,43 @@ impl Experts {
         }
     }
 }
+// Merge packed gate/up rows once at load, as in vLLM's w13 projection.
+// Keep an explicit mixed-format implementation for GGUFs whose two matrices
+// use different block types; never requantize weights to force a merge.
+#[derive(Debug)]
+enum ExpertGateUp {
+    Merged(Experts),
+    Separate { gate: Experts, up: Experts },
+}
+impl ExpertGateUp {
+    fn new(gate: QTensor, up: QTensor, device: &Device) -> Result<Self> {
+        if gate.dtype() == up.dtype() {
+            Ok(Self::Merged(Experts::new(
+                QTensor::cat(&[&gate, &up], 1)?,
+                device,
+            )?))
+        } else {
+            Ok(Self::Separate {
+                gate: Experts::new(gate, device)?,
+                up: Experts::new(up, device)?,
+            })
+        }
+    }
+    fn forward(&self, x: &Tensor, ids: &Tensor) -> Result<Tensor> {
+        match self {
+            Self::Merged(proj) => candle_nn::lfm2::swiglu(&proj.forward(x, ids)?),
+            Self::Separate { gate, up } => {
+                candle_nn::ops::silu(&gate.forward(x, ids)?)? * up.forward(x, ids)?
+            }
+        }
+    }
+}
 #[derive(Debug)]
 struct Moe {
     gate: QMatMul,
     bias: Tensor,
-    up: Experts,
+    gate_up: ExpertGateUp,
     down: Experts,
-    gate_experts: Experts,
     topk: usize,
 }
 impl Moe {
@@ -116,9 +146,7 @@ impl Moe {
         let flat = x.reshape((b * s, h))?;
         let (ids, weights) = route(&self.gate.forward(&flat)?, &self.bias, self.topk)?;
         let x = flat.unsqueeze(1)?;
-        let gate = self.gate_experts.forward(&x, &ids)?;
-        let up = self.up.forward(&x, &ids)?;
-        let activated = (candle_nn::ops::silu(&gate)? * up)?;
+        let activated = self.gate_up.forward(&x, &ids)?;
         self.down
             .forward(&activated, &ids)?
             .broadcast_mul(&weights.unsqueeze(2)?)?
@@ -260,7 +288,18 @@ struct ShortConv {
 impl ShortConv {
     fn forward(&self, x: &Tensor, state: &mut Option<Tensor>) -> Result<Tensor> {
         let h = x.dim(2)?;
-        let bcx = self.input.forward(x)?.transpose(1, 2)?;
+        let projected = self.input.forward(x)?;
+        if x.dim(1)? == 1 {
+            let previous = match state.as_ref() {
+                Some(s) => s.clone(),
+                None => Tensor::zeros((x.dim(0)?, h, self.weight.dim(1)?), x.dtype(), x.device())?,
+            };
+            let (out, next) =
+                candle_nn::lfm2::short_conv_step(&projected, &self.weight, &previous)?;
+            *state = Some(next);
+            return self.output.forward(&out);
+        }
+        let bcx = projected.transpose(1, 2)?;
         let b = bcx.narrow(1, 0, h)?;
         let c = bcx.narrow(1, h, h)?;
         let bx = (b * bcx.narrow(1, 2 * h, h)?)?;
@@ -482,11 +521,8 @@ impl Model {
                 FeedForward::Moe(Moe {
                     gate: QMatMul::from_qtensor(t("ffn_gate_inp.weight", &[experts, hidden])?)?,
                     bias: t("exp_probs_b.bias", &[experts])?.dequantize(device)?,
-                    gate_experts: Experts::new(
+                    gate_up: ExpertGateUp::new(
                         t("ffn_gate_exps.weight", &[experts, expert_ff, hidden])?,
-                        device,
-                    )?,
-                    up: Experts::new(
                         t("ffn_up_exps.weight", &[experts, expert_ff, hidden])?,
                         device,
                     )?,
@@ -617,6 +653,64 @@ mod tests {
             a.flatten_all()?.to_vec1::<f32>()?,
             b.flatten_all()?.to_vec1::<f32>()?
         );
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "rocm")]
+    #[ignore = "requires actual ROCm hardware"]
+    fn merged_gate_up_matches_separate_quantized_operations() -> Result<()> {
+        use candle::quantized::GgmlDType;
+        let dev = Device::new_rocm(0)?;
+        let a = Tensor::from_vec(
+            (0..4 * 96 * 256)
+                .map(|i| (i as f32 / 113.).sin())
+                .collect::<Vec<_>>(),
+            (4, 96, 256),
+            &Device::Cpu,
+        )?;
+        let b = Tensor::from_vec(
+            (0..4 * 96 * 256)
+                .map(|i| (i as f32 / 97.).cos())
+                .collect::<Vec<_>>(),
+            (4, 96, 256),
+            &Device::Cpu,
+        )?;
+        for (gate_type, up_type) in [
+            (GgmlDType::Q5K, GgmlDType::Q5K),
+            (GgmlDType::Q6K, GgmlDType::Q6K),
+            (GgmlDType::Q5K, GgmlDType::Q6K),
+        ] {
+            for batch in [1, 17] {
+                let gate = QTensor::quantize_onto(&a, gate_type, &dev)?;
+                let up = QTensor::quantize_onto(&b, up_type, &dev)?;
+                let input = Tensor::from_vec(
+                    (0..batch * 256)
+                        .map(|i| (i as f32 / 127.).cos())
+                        .collect::<Vec<_>>(),
+                    (batch, 1, 256),
+                    &dev,
+                )?;
+                let ids = Tensor::from_vec(
+                    (0..batch * 2).map(|i| (i % 4) as u32).collect::<Vec<_>>(),
+                    (batch, 2),
+                    &dev,
+                )?;
+                let reference = (candle_nn::ops::silu(&gate.indexed_moe_forward(&input, &ids)?)?
+                    * up.indexed_moe_forward(&input, &ids)?)?;
+                let packed = ExpertGateUp::new(gate, up, &dev)?;
+                assert_eq!(
+                    matches!(packed, ExpertGateUp::Merged(_)),
+                    gate_type == up_type
+                );
+                let actual = packed.forward(&input, &ids)?;
+                assert_eq!(
+                    actual.flatten_all()?.to_vec1::<f32>()?,
+                    reference.flatten_all()?.to_vec1::<f32>()?,
+                    "{gate_type:?}/{up_type:?} batch={batch}"
+                );
+            }
+        }
         Ok(())
     }
 

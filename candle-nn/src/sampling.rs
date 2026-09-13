@@ -21,3 +21,8 @@ pub fn gumbel_softmax<D: candle::shape::Dim>(
         }
     }
 }
+
+mod greedy;
+#[cfg(feature = "rocm")]
+mod greedy_rocm;
+pub use greedy::GreedySampler;
