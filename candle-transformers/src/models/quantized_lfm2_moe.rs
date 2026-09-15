@@ -14,19 +14,7 @@ use candle::{bail, DType, Device, IndexOp, Module, Result, Tensor, D};
 use std::sync::Arc;
 
 fn route(logits: &Tensor, bias: &Tensor, topk: usize) -> Result<(Tensor, Tensor)> {
-    let (_, experts) = logits.dims2()?;
-    if topk == 0 || topk > experts || bias.dims1()? != experts {
-        bail!("invalid LFM2 MoE routing dimensions")
-    }
-    let scores = candle_nn::ops::sigmoid(logits)?;
-    let ids = scores
-        .broadcast_add(bias)?
-        .arg_sort_last_dim(false)?
-        .narrow(D::Minus1, 0, topk)?
-        .contiguous()?;
-    let weights = scores.gather(&ids, D::Minus1)?;
-    let weights = weights.broadcast_div(&(weights.sum_keepdim(D::Minus1)? + 1e-6)?)?;
-    Ok((ids, weights))
+    candle_nn::lfm2::moe_route(logits, bias, topk)
 }
 
 /// Direct causal depthwise convolution, including cached multi-token suffixes.
@@ -220,10 +208,7 @@ impl Moe {
         };
         let x = flat.unsqueeze(1)?;
         let activated = self.gate_up.forward(&x, &routing)?;
-        self.down
-            .forward(&activated, &routing)?
-            .broadcast_mul(&weights.unsqueeze(2)?)?
-            .sum(1)?
+        candle_nn::lfm2::moe_combine(&self.down.forward(&activated, &routing)?, &weights)?
             .reshape((b, s, h))
     }
 }
