@@ -45,6 +45,7 @@ mod quantize;
 
 pub use device_ptr::QRocmPtrGuard;
 use kernels::MATRIX_ROW_PADDING;
+pub use moe::GroupedMoeRouting;
 
 #[cfg(test)]
 mod bench;
@@ -316,6 +317,22 @@ impl QRocmStorage {
 
         let out = dense::forward(self, (b, m, n, k), storage, layout)?;
         Ok((out, out_shape.into()))
+    }
+
+    pub(crate) fn supports_grouped_moe(&self, shape: &Shape, batch: usize, topk: usize) -> bool {
+        moe::supports(self, shape, batch, topk)
+    }
+
+    pub(crate) fn grouped_moe_forward(
+        &self,
+        shape: &Shape,
+        input: &RocmStorage,
+        input_l: &Layout,
+        ids: &RocmStorage,
+        ids_l: &Layout,
+        routing: &GroupedMoeRouting,
+    ) -> Result<(RocmStorage, Shape)> {
+        moe::forward_prepared(self, shape, input, input_l, ids, ids_l, routing)
     }
 
     /// `self` is a `(num_experts, n, k)` stack of expert weight matrices.

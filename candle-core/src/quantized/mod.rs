@@ -923,6 +923,49 @@ impl QTensor {
         self.storage.data()
     }
 
+    /// Whether automatic ROCm dispatch uses grouped MMQ for this routing shape.
+    /// Other backends and small/sparse batches return false. This selects a
+    /// dispatch policy; input validation and routing-dependent grid bounds
+    /// are still checked by the forward operation and can return an error.
+    pub fn supports_grouped_moe(&self, batch: usize, topk: usize) -> bool {
+        #[cfg(feature = "rocm")]
+        if let QStorage::Rocm(storage) = &self.storage {
+            return storage.supports_grouped_moe(self.shape(), batch, topk);
+        }
+        let _ = (batch, topk);
+        false
+    }
+
+    /// Apply this weight stack to previously packed ROCm expert assignments.
+    /// The prepared assignments are immutable, even if their original IDs change.
+    /// Shapes, expert count, format, and device/stream must be compatible.
+    #[cfg(feature = "rocm")]
+    pub fn grouped_moe_forward(
+        &self,
+        x: &Tensor,
+        routing: &rocm::GroupedMoeRouting,
+    ) -> Result<Tensor> {
+        match (&self.storage, &*x.storage(), &*routing.ids.storage()) {
+            (QStorage::Rocm(q), Storage::Rocm(input), Storage::Rocm(ids)) => {
+                let (storage, shape) = q.grouped_moe_forward(
+                    self.shape(),
+                    input,
+                    x.layout(),
+                    ids,
+                    routing.ids.layout(),
+                    routing,
+                )?;
+                Ok(crate::tensor::from_storage(
+                    Storage::Rocm(storage),
+                    shape,
+                    crate::op::BackpropOp::none(),
+                    false,
+                ))
+            }
+            _ => crate::bail!("prepared grouped MoE requires ROCm weights and input"),
+        }
+    }
+
     pub fn indexed_moe_forward(&self, x: &Tensor, ids: &Tensor) -> Result<Tensor> {
         match &self.storage {
             QStorage::Cuda(s) => match (&*x.storage(), &*ids.storage()) {

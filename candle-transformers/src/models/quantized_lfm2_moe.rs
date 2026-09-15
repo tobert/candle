@@ -4,11 +4,11 @@
 //! tail space in growable buffers; conflicting branches copy their prefix first.
 //! A failed forward leaves its input state's visible data and position unchanged.
 //! Snapshots are process-local and tied to the loaded model instance.
+mod attention;
 mod kv_cache;
 
 use self::kv_cache::KvCache;
 use crate::quantized_nn::RmsNorm;
-use crate::utils::repeat_kv;
 use candle::quantized::{gguf_file, QMatMul, QTensor};
 use candle::{bail, DType, Device, IndexOp, Module, Result, Tensor, D};
 use std::sync::Arc;
@@ -72,6 +72,29 @@ impl Module for Mlp {
     }
 }
 
+#[cfg(all(test, feature = "rocm"))]
+thread_local! {
+    // Observe model wiring without exposing counters or synchronization in serving.
+    static GROUPED_ROUTE_CALLS: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+// One forward's routing decision. Grouped ROCm gate/up/down share its immutable
+// packed assignments and scratch; decode and other backends keep indexed IDs.
+struct ExpertRouting<'a> {
+    ids: &'a Tensor,
+    #[cfg(feature = "rocm")]
+    grouped: Option<candle::quantized::rocm::GroupedMoeRouting>,
+}
+impl<'a> ExpertRouting<'a> {
+    fn new(ids: &'a Tensor) -> Self {
+        Self {
+            ids,
+            #[cfg(feature = "rocm")]
+            grouped: None,
+        }
+    }
+}
+
 // CPU is an explicit reference implementation, not a GPU fallback.
 #[derive(Debug)]
 enum Experts {
@@ -79,6 +102,13 @@ enum Experts {
     Cpu(Tensor),
 }
 impl Experts {
+    #[cfg(feature = "rocm")]
+    fn supports_grouped(&self, batch: usize, topk: usize) -> bool {
+        match self {
+            Self::Quantized(w) => w.supports_grouped_moe(batch, topk),
+            Self::Cpu(_) => false,
+        }
+    }
     fn new(w: QTensor, device: &Device) -> Result<Self> {
         if device.is_cpu() {
             Ok(Self::Cpu(w.dequantize(device)?))
@@ -86,10 +116,22 @@ impl Experts {
             Ok(Self::Quantized(Arc::new(w)))
         }
     }
-    fn forward(&self, x: &Tensor, ids: &Tensor) -> Result<Tensor> {
+    fn forward(&self, x: &Tensor, routing: &ExpertRouting<'_>) -> Result<Tensor> {
         match self {
-            Self::Quantized(w) => w.indexed_moe_forward(x, ids),
+            Self::Quantized(w) => {
+                #[cfg(feature = "rocm")]
+                if let Some(prepared) = &routing.grouped {
+                    #[cfg(test)]
+                    GROUPED_ROUTE_CALLS.with(|c| {
+                        let (built, used) = c.get();
+                        c.set((built, used + 1));
+                    });
+                    return w.grouped_moe_forward(x, prepared);
+                }
+                w.indexed_moe_forward(x, routing.ids)
+            }
             Self::Cpu(w) => {
+                let ids = routing.ids;
                 let (batch, slots) = ids.dims2()?;
                 let (_, n, k) = w.dims3()?;
                 let weights = w.index_select(&ids.flatten_all()?, 0)?;
@@ -112,6 +154,15 @@ enum ExpertGateUp {
     Separate { gate: Experts, up: Experts },
 }
 impl ExpertGateUp {
+    #[cfg(feature = "rocm")]
+    fn supports_grouped(&self, batch: usize, topk: usize) -> bool {
+        match self {
+            Self::Merged(w) => w.supports_grouped(batch, topk),
+            Self::Separate { gate, up } => {
+                gate.supports_grouped(batch, topk) && up.supports_grouped(batch, topk)
+            }
+        }
+    }
     fn new(gate: QTensor, up: QTensor, device: &Device) -> Result<Self> {
         if gate.dtype() == up.dtype() {
             Ok(Self::Merged(Experts::new(
@@ -125,11 +176,11 @@ impl ExpertGateUp {
             })
         }
     }
-    fn forward(&self, x: &Tensor, ids: &Tensor) -> Result<Tensor> {
+    fn forward(&self, x: &Tensor, routing: &ExpertRouting<'_>) -> Result<Tensor> {
         match self {
-            Self::Merged(proj) => candle_nn::lfm2::swiglu(&proj.forward(x, ids)?),
+            Self::Merged(proj) => candle_nn::lfm2::swiglu(&proj.forward(x, routing)?),
             Self::Separate { gate, up } => {
-                candle_nn::ops::silu(&gate.forward(x, ids)?)? * up.forward(x, ids)?
+                candle_nn::ops::silu(&gate.forward(x, routing)?)? * up.forward(x, routing)?
             }
         }
     }
@@ -147,10 +198,30 @@ impl Moe {
         let (b, s, h) = x.dims3()?;
         let flat = x.reshape((b * s, h))?;
         let (ids, weights) = route(&self.gate.forward(&flat)?, &self.bias, self.topk)?;
+        let routing = ExpertRouting::new(&ids);
+        #[cfg(feature = "rocm")]
+        let routing = if self.gate_up.supports_grouped(b * s, self.topk)
+            && self.down.supports_grouped(b * s, self.topk)
+        {
+            #[cfg(test)]
+            GROUPED_ROUTE_CALLS.with(|c| {
+                let (built, used) = c.get();
+                c.set((built + 1, used));
+            });
+            ExpertRouting {
+                ids: &ids,
+                grouped: Some(candle::quantized::rocm::GroupedMoeRouting::new(
+                    &ids,
+                    self.bias.dims1()?,
+                )?),
+            }
+        } else {
+            routing
+        };
         let x = flat.unsqueeze(1)?;
-        let activated = self.gate_up.forward(&x, &ids)?;
+        let activated = self.gate_up.forward(&x, &routing)?;
         self.down
-            .forward(&activated, &ids)?
+            .forward(&activated, &routing)?
             .broadcast_mul(&weights.unsqueeze(2)?)?
             .sum(1)?
             .reshape((b, s, h))
@@ -330,19 +401,7 @@ impl AttentionLayer {
         let (k, v) = next.current()?;
         *kv_cache = Some(next);
 
-        let k = repeat_kv(k, self.n_head / self.n_kv_head)?;
-        let v = repeat_kv(v, self.n_head / self.n_kv_head)?;
-
-        let att = (q.matmul(&k.t()?)? / (self.head_dim as f64).sqrt())?;
-        let att = match mask {
-            None => att,
-            Some(mask) => {
-                let mask = mask.broadcast_as(att.shape())?;
-                masked_fill(&att, &mask, &self.neg_inf)?
-            }
-        };
-        let att = candle_nn::ops::softmax_last_dim(&att)?;
-        let y = att.matmul(&v.contiguous()?)?;
+        let y = attention::forward(&q, &k, &v, mask, &self.neg_inf)?;
 
         let y = y.transpose(1, 2)?.reshape(&[b_sz, seq_len, n_embd])?;
         self.wo.forward(&y)
@@ -766,6 +825,55 @@ mod tests {
 
     #[test]
     #[cfg(feature = "rocm")]
+    #[ignore = "requires actual ROCm hardware; device failure is an error"]
+    fn model_reuses_one_routing_map_across_expert_projections() -> Result<()> {
+        use candle::quantized::GgmlDType;
+        let device = Device::new_rocm(0)?;
+        let data = |n: usize, scale: f32| {
+            (0..n)
+                .map(|i| (i as f32 / scale).sin() * 0.1)
+                .collect::<Vec<_>>()
+        };
+        let dense = Tensor::from_vec(data(4 * 256 * 256, 61.), (4, 256, 256), &Device::Cpu)?;
+        let x = Tensor::from_vec(data(17 * 256, 43.), (1, 17, 256), &device)?;
+        for (up_dtype, projections) in [(GgmlDType::Q5K, 2), (GgmlDType::Q6K, 3)] {
+            let moe = Moe {
+                gate: QMatMul::Tensor(Tensor::from_vec(data(4 * 256, 17.), (4, 256), &device)?),
+                bias: Tensor::new(&[0f32, 0.1, -0.1, 0.05], &device)?,
+                gate_up: ExpertGateUp::new(
+                    QTensor::quantize_onto(&dense, GgmlDType::Q5K, &device)?,
+                    QTensor::quantize_onto(&dense, up_dtype, &device)?,
+                    &device,
+                )?,
+                down: Experts::new(
+                    QTensor::quantize_onto(&dense, GgmlDType::Q6K, &device)?,
+                    &device,
+                )?,
+                topk: 2,
+            };
+            GROUPED_ROUTE_CALLS.with(|c| c.set((0, 0)));
+            let actual = moe.forward(&x)?;
+            GROUPED_ROUTE_CALLS.with(|c| assert_eq!(c.get(), (1, projections)));
+            let flat = x.reshape((17, 256))?;
+            let (ids, weights) = route(&moe.gate.forward(&flat)?, &moe.bias, moe.topk)?;
+            let unprepared = ExpertRouting::new(&ids);
+            let activated = moe.gate_up.forward(&flat.unsqueeze(1)?, &unprepared)?;
+            let reference = moe
+                .down
+                .forward(&activated, &unprepared)?
+                .broadcast_mul(&weights.unsqueeze(2)?)?
+                .sum(1)?
+                .reshape((1, 17, 256))?;
+            assert_eq!(
+                actual.flatten_all()?.to_vec1::<f32>()?,
+                reference.flatten_all()?.to_vec1::<f32>()?
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "rocm")]
     #[ignore = "requires actual ROCm hardware"]
     fn merged_gate_up_matches_separate_quantized_operations() -> Result<()> {
         use candle::quantized::GgmlDType;
@@ -811,7 +919,7 @@ mod tests {
                     matches!(packed, ExpertGateUp::Merged(_)),
                     gate_type == up_type
                 );
-                let actual = packed.forward(&input, &ids)?;
+                let actual = packed.forward(&input, &ExpertRouting::new(&ids))?;
                 assert_eq!(
                     actual.flatten_all()?.to_vec1::<f32>()?,
                     reference.flatten_all()?.to_vec1::<f32>()?,
@@ -843,9 +951,15 @@ mod tests {
                     (2, slots, 256),
                     &Device::Cpu,
                 )?;
-                let reference = cpu.forward(&x, &ids)?.flatten_all()?.to_vec1::<f32>()?;
+                let reference = cpu
+                    .forward(&x, &ExpertRouting::new(&ids))?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?;
                 let actual = gpu
-                    .forward(&x.to_device(&dev)?, &ids.to_device(&dev)?)?
+                    .forward(
+                        &x.to_device(&dev)?,
+                        &ExpertRouting::new(&ids.to_device(&dev)?),
+                    )?
                     .flatten_all()?
                     .to_vec1::<f32>()?;
                 let scale = reference.iter().map(|v| v.abs()).fold(0f32, f32::max);

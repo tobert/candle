@@ -22,7 +22,52 @@ use crate::backend::BackendDevice;
 use crate::quantized::GgmlDType;
 use crate::rocm_backend::rocm_rs::hip::Dim3;
 use crate::rocm_backend::{kernels, RocmStorage, RocmStorageSlice};
-use crate::{Layout, Result, Shape};
+use crate::{Layout, Result, Shape, Tensor};
+
+/// Immutable GPU-packed token/expert assignments reusable across projections.
+/// Captures the assignments at construction; later mutation of the source IDs
+/// does not alter this routing. Weight stacks must have the same expert count
+/// and device/stream. This object is local to one routing decision, not a model
+/// state snapshot or a cache keyed by Tensor identity.
+pub struct GroupedMoeRouting {
+    pub(crate) ids: Tensor, // Retained for layout/device validation, never re-read for routing.
+    packed: PackedRouting,
+}
+
+impl std::fmt::Debug for GroupedMoeRouting {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GroupedMoeRouting")
+            .field("num_experts", &self.packed.num_experts)
+            .field("batch", &self.packed.batch)
+            .field("topk", &self.packed.topk)
+            .finish_non_exhaustive()
+    }
+}
+
+impl GroupedMoeRouting {
+    pub fn new(ids: &Tensor, num_experts: usize) -> Result<Self> {
+        let packed = match &*ids.storage() {
+            crate::Storage::Rocm(storage) => {
+                PackedRouting::new(storage, ids.layout(), num_experts)?
+            }
+            _ => crate::bail!("grouped MoE routing requires ROCm IDs"),
+        };
+        Ok(Self {
+            ids: ids.clone(),
+            packed,
+        })
+    }
+}
+
+struct PackedRouting {
+    device: crate::rocm_backend::RocmDevice,
+    num_experts: usize,
+    batch: usize,
+    topk: usize,
+    max_count: usize,
+    pairs: crate::rocm_backend::SendSyncDeviceMemory<u32>,
+    counts: crate::rocm_backend::SendSyncDeviceMemory<u32>,
+}
 
 /// `nwarps` the kernel is written for. It is a compile-time constant inside
 /// `indexed_moe_forward`, sizing the `tmp_shared[nwarps - 1][WARP_SIZE]`
@@ -103,7 +148,52 @@ pub(super) fn forward(
     ids: &RocmStorage,
     ids_l: &Layout,
 ) -> Result<(RocmStorage, Shape)> {
-    forward_impl(q, self_shape, input, input_l, ids, ids_l, None)
+    forward_impl(q, self_shape, input, input_l, ids, ids_l, None, None)
+}
+
+pub(super) fn forward_prepared(
+    q: &QRocmStorage,
+    self_shape: &Shape,
+    input: &RocmStorage,
+    input_l: &Layout,
+    ids: &RocmStorage,
+    ids_l: &Layout,
+    routing: &GroupedMoeRouting,
+) -> Result<(RocmStorage, Shape)> {
+    forward_impl(
+        q,
+        self_shape,
+        input,
+        input_l,
+        ids,
+        ids_l,
+        Some(true),
+        Some(&routing.packed),
+    )
+}
+
+pub(super) fn supports(q: &QRocmStorage, shape: &Shape, batch: usize, topk: usize) -> bool {
+    let Ok((num_experts, n, k)) = shape.dims3() else {
+        return false;
+    };
+    num_experts > 0
+        && num_experts <= 65535
+        && n > 0
+        && topk > 0
+        && batch
+            .checked_mul(topk)
+            .is_some_and(|pairs| pairs <= i32::MAX as usize)
+        && use_grouped(
+            q.dtype,
+            &Dims {
+                num_experts,
+                n,
+                k,
+                batch,
+                input_dim1: 1,
+                topk,
+            },
+        )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -115,6 +205,7 @@ fn forward_impl(
     ids: &RocmStorage,
     ids_l: &Layout,
     grouped_override: Option<bool>,
+    prepared: Option<&PackedRouting>,
 ) -> Result<(RocmStorage, Shape)> {
     if !q.device.same_device(&input.device) || !q.device.same_device(&ids.device) {
         crate::bail!(
@@ -192,7 +283,15 @@ fn forward_impl(
     let out = dev.alloc_zeros::<f32>(d.batch * d.topk * d.n)?;
     let grouped = grouped_override.unwrap_or_else(|| use_grouped(q.dtype, &d));
     if grouped {
-        grouped_forward(q, &d, &input_q8_1, ids_mem, ids_offset, &out)?;
+        let owned;
+        let routing = match prepared {
+            Some(p) => p,
+            None => {
+                owned = PackedRouting::new(ids, ids_l, d.num_experts)?;
+                &owned
+            }
+        };
+        grouped_forward(q, &d, &input_q8_1, routing, &out)?;
         return Ok((
             RocmStorage {
                 slice: RocmStorageSlice::F32(out),
@@ -258,12 +357,84 @@ fn use_grouped(dtype: GgmlDType, d: &Dims) -> bool {
         && super::mmq::supports(dtype, d.k)
 }
 
+impl PackedRouting {
+    fn new(ids: &RocmStorage, ids_l: &Layout, num_experts: usize) -> Result<Self> {
+        let (batch, topk) = ids_l.shape().dims2()?;
+        let total_pairs = batch
+            .checked_mul(topk)
+            .filter(|&n| n > 0 && n <= i32::MAX as usize)
+            .ok_or_else(|| crate::Error::Msg("invalid grouped MoE route dimensions".into()))?;
+        if num_experts == 0 || num_experts > 65535 {
+            crate::bail!("invalid grouped MoE expert count")
+        }
+        let (ids_mem, ids_offset) = match (&ids.slice, ids_l.contiguous_offsets()) {
+            (RocmStorageSlice::U32(m), Some((start, end))) if end - start == total_pairs => {
+                (m, start)
+            }
+            _ => crate::bail!("grouped MoE routing requires contiguous u32 IDs"),
+        };
+        let dev = &ids.device;
+        let scratch_len = num_experts
+            .checked_mul(total_pairs)
+            .filter(|&n| n <= i32::MAX as usize)
+            .ok_or_else(|| crate::Error::Msg("grouped MoE routing scratch overflow".into()))?;
+        let pairs = dev.alloc_zeros::<u32>(scratch_len)?;
+        let counts = dev.alloc_zeros::<u32>(num_experts + 1)?;
+        // Input/ID offsets have been checked against their contiguous layouts.
+        let ids_ptr = unsafe { ids_mem.ptr_at(ids_offset) };
+        let pairs_ptr = pairs.as_ptr();
+        let counts_ptr = counts.as_ptr();
+        let total_i = total_pairs as i32;
+        let experts_i = num_experts as i32;
+        let mut args = vec![
+            arg(&ids_ptr),
+            arg(&pairs_ptr),
+            arg(&counts_ptr),
+            arg(&total_i),
+            arg(&experts_i),
+        ];
+        let func = dev.get_or_load_func("moe_group_pairs", &kernels::QUANTIZED)?;
+        func.launch(
+            Dim3::new_1d(num_experts as u32),
+            Dim3::new_1d(256),
+            0,
+            Some(dev.stream()),
+            &mut args,
+        )
+        .map_err(|e| launch_err("moe_group_pairs", e))?;
+        // A small metadata readback (33 u32 for LFM2.5), not the routing tensor.
+        // clone_dtoh synchronizes the owning stream. This makes invalid IDs an
+        // explicit error before any weight reads and bounds the column grid to
+        // the busiest expert, including duplicate routes within the same token.
+        let host_counts = dev.clone_dtoh(&counts)?;
+        if host_counts[num_experts] != 0 {
+            crate::bail!("grouped MoE: expert id is outside the weight stack")
+        }
+        let accounted: u64 = host_counts[..num_experts].iter().map(|n| *n as u64).sum();
+        if accounted != total_pairs as u64 {
+            crate::bail!("grouped MoE routing counts do not account for every pair")
+        }
+        let max_count = *host_counts[..num_experts].iter().max().unwrap() as usize;
+        if max_count == 0 {
+            crate::bail!("grouped MoE produced no routed pairs")
+        }
+        Ok(Self {
+            device: dev.clone(),
+            num_experts,
+            batch,
+            topk,
+            max_count,
+            pairs,
+            counts,
+        })
+    }
+}
+
 fn grouped_forward(
     q: &QRocmStorage,
     d: &Dims,
     input_q8: &crate::rocm_backend::SendSyncDeviceMemory<u8>,
-    ids: &crate::rocm_backend::SendSyncDeviceMemory<u32>,
-    ids_offset: usize,
+    routing: &PackedRouting,
     out: &crate::rocm_backend::SendSyncDeviceMemory<f32>,
 ) -> Result<()> {
     let name = match q.dtype {
@@ -277,54 +448,23 @@ fn grouped_forward(
     let dev = &q.device;
     let plan = super::mmq::plan(q.dtype, dev.mmq_tiles())
         .ok_or_else(|| crate::Error::Msg("missing grouped MoE tile geometry".into()))?;
+    if routing.num_experts != d.num_experts
+        || routing.batch != d.batch
+        || routing.topk != d.topk
+        || !routing.device.same_device(dev)
+    {
+        crate::bail!(
+            "grouped MoE routing does not match weight experts, input shape or device/stream"
+        )
+    }
     let total_pairs = d.batch * d.topk;
-    let scratch_len = d
-        .num_experts
-        .checked_mul(total_pairs)
-        .ok_or_else(|| crate::Error::Msg("grouped MoE routing scratch overflow".into()))?;
-    let pairs = dev.alloc_zeros::<u32>(scratch_len)?;
-    let counts = dev.alloc_zeros::<u32>(d.num_experts + 1)?;
-    // Input/ID offsets have been checked against their contiguous layouts.
-    let ids_ptr = unsafe { ids.ptr_at(ids_offset) };
-    let pairs_ptr = pairs.as_ptr();
-    let counts_ptr = counts.as_ptr();
     let total_i = total_pairs as i32;
-    let experts_i = d.num_experts as i32;
-    let mut args = vec![
-        arg(&ids_ptr),
-        arg(&pairs_ptr),
-        arg(&counts_ptr),
-        arg(&total_i),
-        arg(&experts_i),
-    ];
-    let func = dev.get_or_load_func("moe_group_pairs", &kernels::QUANTIZED)?;
-    func.launch(
-        Dim3::new_1d(d.num_experts as u32),
-        Dim3::new_1d(256),
-        0,
-        Some(dev.stream()),
-        &mut args,
-    )
-    .map_err(|e| launch_err("moe_group_pairs", e))?;
-    // A small metadata readback (33 u32 for LFM2.5), not the routing tensor.
-    // clone_dtoh synchronizes the owning stream. This makes invalid IDs an
-    // explicit error before any weight reads and bounds the column grid to
-    // the busiest expert, including duplicate routes within the same token.
-    let host_counts = dev.clone_dtoh(&counts)?;
-    if host_counts[d.num_experts] != 0 {
-        crate::bail!("grouped MoE: expert id is outside the weight stack")
-    }
-    let accounted: u64 = host_counts[..d.num_experts].iter().map(|n| *n as u64).sum();
-    if accounted != total_pairs as u64 {
-        crate::bail!("grouped MoE routing counts do not account for every pair")
-    }
-    let max_count = *host_counts[..d.num_experts].iter().max().unwrap() as usize;
-    if max_count == 0 {
-        crate::bail!("grouped MoE produced no routed pairs")
-    }
+    let max_count = routing.max_count;
     if max_count.div_ceil(plan.mmq_x) > 65535 {
         crate::bail!("grouped MoE column grid exceeds HIP limit")
     }
+    let pairs_ptr = routing.pairs.as_ptr();
+    let counts_ptr = routing.counts.as_ptr();
     let w_ptr = q.data.as_ptr();
     let y_ptr = input_q8.as_ptr();
     let out_ptr = out.as_ptr();
@@ -383,6 +523,7 @@ fn forward_for_test(
                 ids_s,
                 ids.layout(),
                 Some(grouped),
+                None,
             )?;
             Ok(crate::tensor::from_storage(
                 crate::Storage::Rocm(out),

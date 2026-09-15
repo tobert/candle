@@ -444,3 +444,95 @@ fn grouped_moe_q5_minimum_uses_quantized_activation_sum_rocm() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+#[ignore = "requires actual ROCm hardware; device failure is an error"]
+fn prepared_routing_reuses_packing_and_captures_ids_rocm() -> Result<()> {
+    use super::GroupedMoeRouting;
+    let device = Device::new_rocm(0)?;
+    let (experts, batch, topk, n, k) = (4, 32, 3, 96, 256);
+    let ids_data = (0..(batch + 1) * topk)
+        .map(|i| ((i * 7 + i / 3) % experts) as u32)
+        .collect::<Vec<_>>();
+    let ids = Tensor::from_vec(ids_data, (batch + 1, topk), &device)?.narrow(0, 1, batch)?;
+    let routing = GroupedMoeRouting::new(&ids, experts)?;
+    let pairs_address = routing.packed.pairs.as_ptr();
+    let counts_address = routing.packed.counts.as_ptr();
+    let mut cases = Vec::new();
+    for (dtype, slots) in [(GgmlDType::Q5K, 1), (GgmlDType::Q6K, topk)] {
+        let dense = Tensor::from_vec(ramp(experts * n * k, 61.), (experts, n, k), &Device::Cpu)?;
+        let weights = QTensor::quantize_onto(&dense, dtype, &device)?;
+        let input = Tensor::from_vec(
+            ramp((batch + 1) * slots * k, 43.),
+            (batch + 1, slots, k),
+            &device,
+        )?
+        .narrow(0, 1, batch)?;
+        assert!(weights.supports_grouped_moe(batch, topk));
+        let expected = weights
+            .indexed_moe_forward(&input, &ids)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let actual = weights
+            .grouped_moe_forward(&input, &routing)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        assert_eq!(expected, actual);
+        cases.push((weights, input, expected));
+    }
+    // Prepared routing is a snapshot of assignments, not a memo indexed by a
+    // mutable Tensor identity. Changing the source IDs must not change it.
+    ids.slice_set(
+        &Tensor::zeros((batch, topk), crate::DType::U32, &device)?,
+        0,
+        0,
+    )?;
+    for (weights, input, expected) in cases {
+        assert_eq!(
+            expected,
+            weights
+                .grouped_moe_forward(&input, &routing)?
+                .flatten_all()?
+                .to_vec1::<f32>()?
+        );
+        assert_ne!(
+            expected,
+            weights
+                .indexed_moe_forward(&input, &ids)?
+                .flatten_all()?
+                .to_vec1::<f32>()?
+        );
+    }
+    assert_eq!(pairs_address, routing.packed.pairs.as_ptr());
+    assert_eq!(counts_address, routing.packed.counts.as_ptr());
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires actual ROCm hardware; device failure is an error"]
+fn prepared_routing_rejects_bad_ids_weights_and_devices_rocm() -> Result<()> {
+    use super::GroupedMoeRouting;
+    let device = Device::new_rocm(0)?;
+    let ids = Tensor::zeros((32, 2), crate::DType::U32, &device)?;
+    assert!(GroupedMoeRouting::new(&ids, 0).is_err());
+    assert!(GroupedMoeRouting::new(&ids.to_dtype(crate::DType::F32)?, 4).is_err());
+    assert!(GroupedMoeRouting::new(&Tensor::full(4u32, (32, 2), &device)?, 4).is_err());
+    assert!(GroupedMoeRouting::new(&ids.transpose(0, 1)?, 4).is_err());
+    let routing = GroupedMoeRouting::new(&ids, 4)?;
+    let dense = Tensor::zeros((2, 96, 256), crate::DType::F32, &Device::Cpu)?;
+    let weights = QTensor::quantize_onto(&dense, GgmlDType::Q5K, &device)?;
+    let input = Tensor::zeros((32, 1, 256), crate::DType::F32, &device)?;
+    assert!(weights.grouped_moe_forward(&input, &routing).is_err());
+    let other_device = Device::new_rocm(0)?;
+    let foreign = GroupedMoeRouting::new(
+        &Tensor::zeros((32, 2), crate::DType::U32, &other_device)?,
+        2,
+    )?;
+    assert!(weights.grouped_moe_forward(&input, &foreign).is_err());
+    let correct = GroupedMoeRouting::new(&ids, 2)?;
+    assert!(weights
+        .grouped_moe_forward(&input.narrow(0, 0, 31)?, &correct)
+        .is_err());
+    assert!(!weights.supports_grouped_moe(1, 2));
+    Ok(())
+}
