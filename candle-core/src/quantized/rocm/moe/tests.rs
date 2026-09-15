@@ -9,6 +9,95 @@ use crate::quantized::{GgmlDType, QTensor};
 use crate::rocm_backend::RocmDevice;
 use crate::{Device, Result, Tensor};
 
+thread_local! {
+    static WORK_BUFFER_PATTERN: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
+}
+
+// Runs only in tests. Production buffers receive no initialization; tests can
+// inject deterministic old contents without depending on allocator reuse.
+pub(super) fn initialize_work_buffer<T>(
+    mut buffer: crate::rocm_backend::SendSyncDeviceMemory<T>,
+) -> Result<crate::rocm_backend::SendSyncDeviceMemory<T>> {
+    if let Some(pattern) = WORK_BUFFER_PATTERN.get() {
+        buffer.memset(pattern).map_err(crate::Error::wrap)?;
+    }
+    Ok(buffer)
+}
+
+fn with_work_buffer_pattern<T>(pattern: i32, f: impl FnOnce() -> Result<T>) -> Result<T> {
+    struct Reset(Option<i32>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            WORK_BUFFER_PATTERN.set(self.0);
+        }
+    }
+    let _reset = Reset(WORK_BUFFER_PATTERN.replace(Some(pattern)));
+    f()
+}
+
+#[test]
+#[ignore = "requires actual ROCm hardware"]
+fn expert_buffers_overwrite_dirty_storage_rocm() -> Result<()> {
+    let device = Device::new_rocm(0)?;
+    // Directly witness the test hook, so dropping it cannot silently turn this
+    // into a test that only ever sees clean allocations.
+    let Device::Rocm(dev) = &device else {
+        unreachable!()
+    };
+    let probe = with_work_buffer_pattern(0x5a, || super::work_buffer::<u8>(dev, 73))?;
+    assert_eq!(dev.clone_dtoh(&probe)?, vec![0x5a; 73]);
+
+    for dtype in MOE_DTYPES {
+        let mut cases = vec![(1, 1, 1, 256, false), (3, 4, 17, 768, false)];
+        if matches!(dtype, GgmlDType::Q5K | GgmlDType::Q6K) {
+            cases.extend([(65, 4, 131, 768, true), (33, 4, 1, 256, true)]);
+        }
+        for (batch, topk, n, k, grouped) in cases {
+            let weights = QTensor::quantize_onto(
+                &Tensor::from_vec(ramp(5 * n * k, 61.), (5, n, k), &Device::Cpu)?,
+                dtype,
+                &device,
+            )?;
+            for input_dim1 in [1, topk] {
+                let input = Tensor::from_vec(
+                    ramp((batch + 1) * input_dim1 * k, 43.),
+                    (batch + 1, input_dim1, k),
+                    &device,
+                )?
+                .narrow(0, 1, batch)?;
+                // Repeated expert IDs (all one expert for the grouped singleton
+                // output case), unused experts, and a nonzero ID view offset.
+                let ids = Tensor::from_vec(
+                    (0..(batch + 1) * topk)
+                        .map(|i| {
+                            if n == 1 {
+                                3u32
+                            } else {
+                                ((i / 2 + 1) % 4) as u32
+                            }
+                        })
+                        .collect(),
+                    (batch + 1, topk),
+                    &device,
+                )?
+                .narrow(0, 1, batch)?;
+                let run = || {
+                    super::forward_for_test(&weights, &input, &ids, grouped)?
+                        .flatten_all()?
+                        .to_vec1::<f32>()
+                };
+                let expected = with_work_buffer_pattern(0, run)?;
+                assert!(expected.iter().all(|v| v.is_finite()));
+                for pattern in [0xff, 0x5a] {
+                    let got = with_work_buffer_pattern(pattern, run)?;
+                    assert_eq!(got, expected, "dtype={dtype:?}, grouped={grouped}, batch={batch}, topk={topk}, input_dim1={input_dim1}");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// `RocmDevice::new` fails on machines without a GPU; those runs skip.
 macro_rules! rocm_device {
     () => {

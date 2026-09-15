@@ -21,7 +21,9 @@ use super::QRocmStorage;
 use crate::backend::BackendDevice;
 use crate::quantized::GgmlDType;
 use crate::rocm_backend::rocm_rs::hip::Dim3;
-use crate::rocm_backend::{kernels, RocmStorage, RocmStorageSlice};
+use crate::rocm_backend::{
+    kernels, RocmDevice, RocmStorage, RocmStorageSlice, SendSyncDeviceMemory,
+};
 use crate::{Layout, Result, Shape, Tensor};
 
 /// Immutable GPU-packed token/expert assignments reusable across projections.
@@ -73,6 +75,15 @@ struct PackedRouting {
 /// `indexed_moe_forward`, sizing the `tmp_shared[nwarps - 1][WARP_SIZE]`
 /// inter-warp reduction buffer, so `blockDim.y` has to be exactly this.
 const NWARPS: usize = 4;
+
+// Only for buffers whose producers overwrite every element before any read.
+// Test builds can seed these allocations with dirty bytes to verify that contract.
+fn work_buffer<T>(dev: &RocmDevice, len: usize) -> Result<SendSyncDeviceMemory<T>> {
+    let buffer = dev.alloc::<T>(len)?;
+    #[cfg(test)]
+    let buffer = tests::initialize_work_buffer(buffer)?;
+    Ok(buffer)
+}
 
 /// Kernel entry point for `dtype`, or `None` when there is none.
 ///
@@ -277,10 +288,15 @@ fn forward_impl(
     let dev = &q.device;
     let total_rows = d.batch * d.input_dim1;
     let k_padded = pad(d.k, MATRIX_ROW_PADDING);
-    let input_q8_1 = dev.alloc_zeros::<u8>(buffer_bytes(d.k, total_rows))?;
+    // quantize_q8_1 writes all qs and both half headers in every 32-value
+    // block, including the zero-padded tail of each 512-column row stride.
+    let input_q8_1 = work_buffer::<u8>(dev, buffer_bytes(d.k, total_rows))?;
     quantize_q8_1(y, y_offset, &input_q8_1, d.k, total_rows, dev)?;
 
-    let out = dev.alloc_zeros::<f32>(d.batch * d.topk * d.n)?;
+    // Vector kernels assign one output per (row, token, slot); grouped kernels
+    // assign every valid routed pair's rows, including partial tiles. Neither
+    // accumulates into out. Launch/validation errors return before exposing it.
+    let out = work_buffer::<f32>(dev, d.batch * d.topk * d.n)?;
     let grouped = grouped_override.unwrap_or_else(|| use_grouped(q.dtype, &d));
     if grouped {
         let owned;

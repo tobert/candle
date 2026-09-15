@@ -11,6 +11,9 @@ use crate::rocm_backend::rocm_rs::hip::Dim3;
 use crate::rocm_backend::{kernels, RocmDevice, SendSyncDeviceMemory};
 use crate::Result;
 
+#[cfg(test)]
+mod tests;
+
 /// `quantize_q8_1`'s thread block (`CUDA_QUANTIZE_BLOCK_SIZE`). A block covers
 /// 256 columns, i.e. eight `QK8_1` blocks, one per wave32.
 const QUANTIZE_BLOCK_SIZE: usize = 256;
@@ -53,6 +56,8 @@ pub(super) fn buffer_bytes(k: usize, rows: usize) -> usize {
 /// filled by the kernel itself (`const float xi = ix < kx ? x[iy*kx + ix] : 0`),
 /// so `dst` must be sized for the *padded* width — [`buffer_bytes`]. `x` is
 /// indexed as `iy*kx`, i.e. the source rows are packed at their unpadded width.
+/// Every payload byte is written, including each block's scale/sum half fields;
+/// the destination does not require initialization before this operation.
 pub(super) fn quantize_q8_1(
     src: &SendSyncDeviceMemory<f32>,
     src_offset: usize,
