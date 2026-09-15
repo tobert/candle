@@ -1,10 +1,12 @@
 //! Quantized LFM2 MoE causal decoder (including LFM2.5-8B-A1B).
 //!
-//! Weights are immutable. State clones share immutable tensor storage; every
-//! append allocates replacement tensors. No slice_set/scatter_set is permitted
-//! on state storage. This is copy-on-write at the tensor replacement boundary,
-//! not an append-optimized allocator. A failed forward leaves its input state
-//! unchanged. Snapshots are process-local and tied to the loaded model instance.
+//! Weights and committed state prefixes are immutable. CPU/ROCm KV appends reserve fresh
+//! tail space in growable buffers; conflicting branches copy their prefix first.
+//! A failed forward leaves its input state's visible data and position unchanged.
+//! Snapshots are process-local and tied to the loaded model instance.
+mod kv_cache;
+
+use self::kv_cache::KvCache;
 use crate::quantized_nn::RmsNorm;
 use crate::utils::repeat_kv;
 use candle::quantized::{gguf_file, QMatMul, QTensor};
@@ -297,7 +299,7 @@ impl AttentionLayer {
         xs: &Tensor,
         mask: Option<&Tensor>,
         index_pos: usize,
-        kv_cache: &mut Option<(Tensor, Tensor)>,
+        kv_cache: &mut Option<KvCache>,
     ) -> Result<Tensor> {
         let _enter = self.span_attn.enter();
         let (b_sz, seq_len, n_embd) = xs.dims3()?;
@@ -321,19 +323,12 @@ impl AttentionLayer {
         let q = self.apply_rotary_emb(&q, index_pos)?;
         let k = self.apply_rotary_emb(&k, index_pos)?;
 
-        let (k, v) = match &*kv_cache {
-            None => (k, v),
-            Some((k_cache, v_cache)) => {
-                if index_pos == 0 {
-                    (k, v)
-                } else {
-                    let k = Tensor::cat(&[k_cache, &k], 2)?;
-                    let v = Tensor::cat(&[v_cache, &v], 2)?;
-                    (k, v)
-                }
-            }
-        };
-        *kv_cache = Some((k.clone(), v.clone()));
+        if kv_cache.as_ref().map_or(0, KvCache::len) != index_pos {
+            bail!("LFM2 KV position does not match state")
+        }
+        let next = KvCache::append(kv_cache.as_ref(), &k, &v, self.cos.dim(0)?)?;
+        let (k, v) = next.current()?;
+        *kv_cache = Some(next);
 
         let k = repeat_kv(k, self.n_head / self.n_kv_head)?;
         let v = repeat_kv(v, self.n_head / self.n_kv_head)?;
@@ -398,13 +393,13 @@ struct Layer {
 }
 
 /// An opaque, branchable snapshot of the entire causal hybrid state.
-/// Cloning shares immutable storage. It cannot be used with another model,
-/// even when that model happens to have the same shape.
+/// Cloning shares immutable prefixes of append-only storage. It cannot be used
+/// with another model, even when that model happens to have the same shape.
 #[derive(Debug, Clone)]
 pub struct State {
     owner: Arc<()>,
     len: usize,
-    kv: Vec<Option<(Tensor, Tensor)>>,
+    kv: Vec<Option<KvCache>>,
     conv: Vec<Option<Tensor>>,
 }
 impl State {
@@ -716,26 +711,57 @@ mod tests {
         }
         Ok(())
     }
-    #[test]
-    fn failure_after_all_layers_does_not_commit_state() -> Result<()> {
+    fn check_failed_forward(inside_conv: bool) -> Result<()> {
+        let device = &Device::Cpu;
+        fn output_to_break(model: &mut Model, inside_conv: bool) -> &mut QMatMul {
+            if inside_conv {
+                match &mut model.layers[2].operator {
+                    Operator::Conv(conv) => &mut conv.output,
+                    _ => panic!("fixture must end with convolution"),
+                }
+            } else {
+                &mut model.output
+            }
+        }
         let mut f = std::io::Cursor::new(include_bytes!("../../tests/fixtures/lfm2-moe/tiny.gguf"));
         let ct = gguf_file::Content::read(&mut f)?;
-        let mut model = Model::from_gguf(ct, &mut f, &Device::Cpu)?;
+        let mut model = Model::from_gguf(ct, &mut f, device)?;
         let mut prefix = model.new_state();
         let _ = model.forward(&[1, 2, 3], &mut prefix)?;
         let saved = prefix.clone();
-        let good_output = model.output.clone();
-        model.output = QMatMul::Tensor(Tensor::zeros((1, 1), DType::F32, &Device::Cpu)?);
+        let bad_output = QMatMul::Tensor(Tensor::zeros((1, 1), DType::F32, device)?);
+        let good_output = std::mem::replace(output_to_break(&mut model, inside_conv), bad_output);
         assert!(model.forward(&[4, 5], &mut prefix).is_err());
         assert_eq!(prefix.len(), 3);
-        model.output = good_output;
-        let a = model.forward(&[4, 5], &mut prefix)?;
-        let b = model.forward(&[4, 5], &mut saved.clone())?;
+        *output_to_break(&mut model, inside_conv) = good_output;
+        // Retry different tokens and a different length. Comparing only two
+        // clones could miss corruption shared by both; also compare cold truth.
+        let a = model.forward(&[9, 8, 7], &mut prefix)?;
+        let b = model.forward(&[9, 8, 7], &mut saved.clone())?;
+        let cold = model.forward(&[1, 2, 3, 9, 8, 7], &mut model.new_state())?;
+        for (actual, expected) in a
+            .flatten_all()?
+            .to_vec1::<f32>()?
+            .iter()
+            .zip(cold.flatten_all()?.to_vec1::<f32>()?)
+        {
+            assert!((actual - expected).abs() < 2e-5, "{actual} vs {expected}");
+        }
         assert_eq!(
             a.flatten_all()?.to_vec1::<f32>()?,
             b.flatten_all()?.to_vec1::<f32>()?
         );
         Ok(())
+    }
+
+    #[test]
+    fn failure_after_all_layers_does_not_commit_state() -> Result<()> {
+        check_failed_forward(false)
+    }
+
+    #[test]
+    fn failure_inside_convolution_does_not_commit_state() -> Result<()> {
+        check_failed_forward(true)
     }
 
     #[test]
