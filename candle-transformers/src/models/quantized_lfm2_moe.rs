@@ -17,6 +17,63 @@ fn route(logits: &Tensor, bias: &Tensor, topk: usize) -> Result<(Tensor, Tensor)
     candle_nn::lfm2::moe_route(logits, bias, topk)
 }
 
+/// Read-only taps on one [`Model::forward_observed`] call, for examining the
+/// model rather than serving it. Tensors stay on the model's device and are
+/// the very values the forward goes on to use; copying to the host, and the
+/// device synchronisation that costs, is the observer's decision. An error
+/// fails the forward, which then commits no state.
+pub trait Observer {
+    /// Token embeddings entering layer 0: `(1, seq, hidden)`.
+    fn embedding(&mut self, _x: &Tensor) -> Result<()> {
+        Ok(())
+    }
+    /// The residual stream leaving `layer`, feed-forward included:
+    /// `(1, seq, hidden)`. [`Model::project`] reads it as logits.
+    fn residual(&mut self, _layer: usize, _x: &Tensor) -> Result<()> {
+        Ok(())
+    }
+    /// One expert layer's routing. `logits` `(seq, experts)` are the raw router
+    /// outputs before the sigmoid and the selection bias; `ids` `(seq, topk)`
+    /// the chosen experts; `weights` `(seq, topk)` their normalised, unbiased
+    /// combine weights. Dense layers never call this.
+    fn routing(
+        &mut self,
+        _layer: usize,
+        _logits: &Tensor,
+        _ids: &Tensor,
+        _weights: &Tensor,
+    ) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// The write side of [`Observer`]: replacement selection biases for chosen
+/// expert layers, for one [`Model::forward_steered`] call.
+///
+/// A router chooses its experts by `sigmoid(logit) + bias` and weights them by
+/// `sigmoid(logit)` alone, so replacing the bias is the whole vocabulary of
+/// routing intervention: a large negative entry knocks an expert out, a large
+/// positive one forces it in, a small delta nudges it, and in every case the
+/// chosen experts are still weighted by their own scores. Layers not named keep
+/// their trained bias. An empty `Steering` is exactly [`Model::forward`].
+///
+/// This is an instrument for examining a model. A state produced under steering
+/// is a different computation from one that was not; nothing here records which
+/// is which, so a caller that caches states must key them by their steering.
+#[derive(Debug, Default, Clone)]
+pub struct Steering {
+    bias: std::collections::BTreeMap<usize, Tensor>,
+}
+impl Steering {
+    /// Use `bias` `(experts,)` in place of `layer`'s selection bias.
+    pub fn set_bias(&mut self, layer: usize, bias: Tensor) {
+        self.bias.insert(layer, bias);
+    }
+    pub fn is_empty(&self) -> bool {
+        self.bias.is_empty()
+    }
+}
+
 /// Direct causal depthwise convolution, including cached multi-token suffixes.
 /// State holds the last k gated inputs (not projected outputs).
 fn causal_conv(bx: &Tensor, weight: &Tensor, state: Option<&Tensor>) -> Result<(Tensor, Tensor)> {
@@ -182,10 +239,19 @@ struct Moe {
     topk: usize,
 }
 impl Moe {
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+    fn forward(
+        &self,
+        x: &Tensor,
+        tap: Option<(usize, &mut dyn Observer)>,
+        bias: Option<&Tensor>,
+    ) -> Result<Tensor> {
         let (b, s, h) = x.dims3()?;
         let flat = x.reshape((b * s, h))?;
-        let (ids, weights) = route(&self.gate.forward(&flat)?, &self.bias, self.topk)?;
+        let logits = self.gate.forward(&flat)?;
+        let (ids, weights) = route(&logits, bias.unwrap_or(&self.bias), self.topk)?;
+        if let Some((layer, observer)) = tap {
+            observer.routing(layer, &logits, &ids, &weights)?;
+        }
         let routing = ExpertRouting::new(&ids);
         #[cfg(feature = "rocm")]
         let routing = if self.gate_up.supports_grouped(b * s, self.topk)
@@ -218,10 +284,15 @@ enum FeedForward {
     Moe(Moe),
 }
 impl FeedForward {
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+    fn forward(
+        &self,
+        x: &Tensor,
+        tap: Option<(usize, &mut dyn Observer)>,
+        bias: Option<&Tensor>,
+    ) -> Result<Tensor> {
         match self {
             Self::Dense(m) => m.forward(x),
-            Self::Moe(m) => m.forward(x),
+            Self::Moe(m) => m.forward(x, tap, bias),
         }
     }
 }
@@ -436,6 +507,15 @@ struct Layer {
     ffn: FeedForward,
 }
 
+/// What one layer is made of, for labelling an [`Observer`]'s taps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LayerInfo {
+    /// Full attention; otherwise the gated short convolution.
+    pub attention: bool,
+    /// `(experts, experts used per token)`; `None` for a dense feed-forward.
+    pub experts: Option<(usize, usize)>,
+}
+
 /// An opaque, branchable snapshot of the entire causal hybrid state.
 /// Cloning shares immutable prefixes of append-only storage. It cannot be used
 /// with another model, even when that model happens to have the same shape.
@@ -491,10 +571,92 @@ impl Model {
     pub fn hidden_size(&self) -> usize {
         self.hidden
     }
+    pub fn device(&self) -> &Device {
+        &self.device
+    }
+    /// An expert layer's selection bias `(experts,)`: added to the sigmoid
+    /// scores to CHOOSE experts, never to weight them. `None` for a dense layer.
+    pub fn router_bias(&self, layer: usize) -> Option<&Tensor> {
+        match &self.layers.get(layer)?.ffn {
+            FeedForward::Dense(_) => None,
+            FeedForward::Moe(m) => Some(&m.bias),
+        }
+    }
+    pub fn layers(&self) -> Vec<LayerInfo> {
+        self.layers
+            .iter()
+            .map(|l| LayerInfo {
+                attention: matches!(l.operator, Operator::Attention(_)),
+                experts: match &l.ffn {
+                    FeedForward::Dense(_) => None,
+                    FeedForward::Moe(m) => Some((m.bias.dims()[0], m.topk)),
+                },
+            })
+            .collect()
+    }
 
     /// Batch-one forward, returning next-token logits. Caller bounds prefill
     /// chunks; all validation happens before committing the new state.
     pub fn forward(&self, tokens: &[u32], state: &mut State) -> Result<Tensor> {
+        self.run(tokens, state, None, None)
+    }
+
+    /// [`Model::forward`] with the named routers' selection biases replaced for
+    /// this call, and optionally observed; the observer sees the routing that
+    /// actually ran. Steering a layer that has no router, or with a bias of the
+    /// wrong shape, dtype or device, is refused before anything runs.
+    pub fn forward_steered(
+        &self,
+        tokens: &[u32],
+        state: &mut State,
+        steering: &Steering,
+        observer: Option<&mut dyn Observer>,
+    ) -> Result<Tensor> {
+        for (&layer, bias) in &steering.bias {
+            let own = self
+                .router_bias(layer)
+                .ok_or_else(|| candle::Error::Msg(format!("layer {layer} has no router to steer")))?;
+            if bias.dims() != own.dims()
+                || bias.dtype() != own.dtype()
+                || !bias.device().same_device(own.device())
+            {
+                bail!("steering bias for layer {layer} must match the router's own: {own:?}")
+            }
+        }
+        self.run(tokens, state, observer, Some(steering))
+    }
+
+    /// [`Model::forward`] with `observer` called at each tap. It executes the
+    /// same operations in the same order, so logits and committed state are
+    /// bit-identical to the unobserved call.
+    pub fn forward_observed(
+        &self,
+        tokens: &[u32],
+        state: &mut State,
+        observer: &mut dyn Observer,
+    ) -> Result<Tensor> {
+        self.run(tokens, state, Some(observer), None)
+    }
+
+    /// The logit lens: read a residual stream `(1, seq, hidden)` from any depth
+    /// through the model's own final norm and output projection, giving
+    /// `(1, seq, vocab)`. On the last layer's residual this is exactly what
+    /// [`Model::forward`] returns for the final position.
+    pub fn project(&self, residual: &Tensor) -> Result<Tensor> {
+        let (batch, _, hidden) = residual.dims3()?;
+        if batch != 1 || hidden != self.hidden {
+            bail!("residual must be (1, seq, {})", self.hidden)
+        }
+        self.output.forward(&self.norm.forward(residual)?)
+    }
+
+    fn run(
+        &self,
+        tokens: &[u32],
+        state: &mut State,
+        mut observer: Option<&mut dyn Observer>,
+        steering: Option<&Steering>,
+    ) -> Result<Tensor> {
         if !self.owns_state(state) {
             bail!("snapshot belongs to another model")
         }
@@ -521,6 +683,9 @@ impl Model {
             None
         };
         let mut x = self.embedding.embedding(&ids)?;
+        if let Some(o) = observer.as_deref_mut() {
+            o.embedding(&x)?;
+        }
         for (i, layer) in self.layers.iter().enumerate() {
             let normed = layer.norm.forward(&x)?;
             let y = match &layer.operator {
@@ -530,7 +695,17 @@ impl Model {
                 Operator::Conv(c) => c.forward(&normed, &mut next.conv[i])?,
             };
             x = (x + y)?;
-            x = (&x + layer.ffn.forward(&layer.ffn_norm.forward(&x)?)?)?;
+            // A match, not `map`: the reborrow has to pass through a coercion
+            // site to shorten the trait object's lifetime for this iteration.
+            let tap: Option<(usize, &mut dyn Observer)> = match &mut observer {
+                Some(o) => Some((i, &mut **o)),
+                None => None,
+            };
+            let bias = steering.and_then(|s| s.bias.get(&i));
+            x = (&x + layer.ffn.forward(&layer.ffn_norm.forward(&x)?, tap, bias)?)?;
+            if let Some(o) = observer.as_deref_mut() {
+                o.residual(i, &x)?;
+            }
         }
         let x = self.norm.forward(&x)?.i((.., seq - 1, ..))?.contiguous()?;
         let logits = self.output.forward(&x)?;
@@ -798,6 +973,291 @@ mod tests {
         Ok(())
     }
 
+    fn tiny() -> Result<Model> {
+        let mut f = std::io::Cursor::new(include_bytes!("../../tests/fixtures/lfm2-moe/tiny.gguf"));
+        let ct = gguf_file::Content::read(&mut f)?;
+        Model::from_gguf(ct, &mut f, &Device::Cpu)
+    }
+    fn flat(t: &Tensor) -> Result<Vec<f32>> {
+        t.flatten_all()?.to_vec1::<f32>()
+    }
+
+    #[derive(Default)]
+    struct Recorder {
+        embedding: Vec<Vec<f32>>,
+        residual: Vec<(usize, Vec<usize>, Vec<f32>)>,
+        routing: Vec<(usize, Vec<Vec<f32>>, Vec<Vec<u32>>, Vec<Vec<f32>>)>,
+        fail_at_layer: Option<usize>,
+    }
+    impl Observer for Recorder {
+        fn embedding(&mut self, x: &Tensor) -> Result<()> {
+            self.embedding.push(flat(x)?);
+            Ok(())
+        }
+        fn residual(&mut self, layer: usize, x: &Tensor) -> Result<()> {
+            if self.fail_at_layer == Some(layer) {
+                bail!("observer refused layer {layer}")
+            }
+            self.residual.push((layer, x.dims().to_vec(), flat(x)?));
+            Ok(())
+        }
+        fn routing(
+            &mut self,
+            layer: usize,
+            logits: &Tensor,
+            ids: &Tensor,
+            weights: &Tensor,
+        ) -> Result<()> {
+            self.routing.push((
+                layer,
+                logits.to_vec2::<f32>()?,
+                ids.to_vec2::<u32>()?,
+                weights.to_vec2::<f32>()?,
+            ));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn observed_forward_is_bit_identical_to_the_unobserved_one() -> Result<()> {
+        let model = tiny()?;
+        let (mut plain, mut seen) = (model.new_state(), model.new_state());
+        let mut rec = Recorder::default();
+        let a = model.forward(&[1, 2, 3, 4, 5], &mut plain)?;
+        let b = model.forward_observed(&[1, 2, 3, 4, 5], &mut seen, &mut rec)?;
+        assert_eq!(flat(&a)?, flat(&b)?);
+        // The committed hybrid state must match too, not only this step's logits.
+        assert_eq!(seen.len(), plain.len());
+        assert_eq!(
+            flat(&model.forward(&[6, 7], &mut plain)?)?,
+            flat(&model.forward(&[6, 7], &mut seen)?)?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn observer_sees_every_layer_once_and_routing_only_where_experts_are() -> Result<()> {
+        let model = tiny()?;
+        let mut rec = Recorder::default();
+        model.forward_observed(&[1, 2, 3, 4, 5], &mut model.new_state(), &mut rec)?;
+        assert_eq!(rec.embedding.len(), 1);
+        assert_eq!(rec.embedding[0].len(), 5 * 8);
+        assert_eq!(
+            rec.residual.iter().map(|r| r.0).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        for (_, dims, _) in &rec.residual {
+            assert_eq!(dims, &vec![1, 5, 8]);
+        }
+        // Fixture: conv, attention, conv; one leading dense block, then 3 experts
+        // choosing 2. So layer 0 has no router.
+        let moe = Some((3, 2));
+        assert_eq!(
+            model.layers(),
+            vec![
+                LayerInfo { attention: false, experts: None },
+                LayerInfo { attention: true, experts: moe },
+                LayerInfo { attention: false, experts: moe },
+            ]
+        );
+        assert_eq!(
+            rec.routing.iter().map(|r| r.0).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert!(model.router_bias(0).is_none() && model.router_bias(3).is_none());
+        for (layer, logits, ids, weights) in &rec.routing {
+            assert_eq!((logits.len(), ids.len(), weights.len()), (5, 5, 5));
+            // The reported choice is reproducible from what the record holds:
+            // the top sigmoid(logit) + bias, recomputed here on the host.
+            let bias = model.router_bias(*layer).unwrap().to_vec1::<f32>()?;
+            for (l, i) in logits.iter().zip(ids) {
+                let mut order: Vec<u32> = (0..3).collect();
+                let score = |e: &u32| 1. / (1. + (-l[*e as usize]).exp()) + bias[*e as usize];
+                order.sort_by(|a, b| score(b).total_cmp(&score(a)));
+                let (mut got, mut want) = (i.clone(), order[..2].to_vec());
+                got.sort();
+                want.sort();
+                assert_eq!(got, want, "layer {layer}");
+            }
+            for ((l, i), w) in logits.iter().zip(ids).zip(weights) {
+                assert_eq!((l.len(), i.len(), w.len()), (3, 2, 2), "layer {layer}");
+                assert!(i[0] != i[1] && i.iter().all(|&e| e < 3), "{i:?}");
+                // Reported weights are the ones the combine used: unbiased
+                // sigmoid scores of the chosen experts, normalised with 1e-6.
+                let s: Vec<f32> = i
+                    .iter()
+                    .map(|&e| 1. / (1. + (-l[e as usize]).exp()))
+                    .collect();
+                for (got, score) in w.iter().zip(&s) {
+                    let want = score / (s[0] + s[1] + 1e-6);
+                    assert!((got - want).abs() < 1e-6, "{got} vs {want}");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn observation_is_causal_across_chunk_boundaries() -> Result<()> {
+        // A position's routing and residual cannot depend on how the caller
+        // chunked the prefill. Catches position or layer mix-ups in the tap.
+        let model = tiny()?;
+        let mut whole = Recorder::default();
+        model.forward_observed(&[1, 2, 3, 4, 5], &mut model.new_state(), &mut whole)?;
+        let (mut head, mut tail) = (Recorder::default(), Recorder::default());
+        let mut state = model.new_state();
+        model.forward_observed(&[1, 2, 3], &mut state, &mut head)?;
+        model.forward_observed(&[4, 5], &mut state, &mut tail)?;
+        for n in 0..2 {
+            let mut ids = head.routing[n].2.clone();
+            ids.extend(tail.routing[n].2.clone());
+            assert_eq!(ids, whole.routing[n].2, "router {n}");
+        }
+        for n in 0..3 {
+            let mut x = head.residual[n].2.clone();
+            x.extend(tail.residual[n].2.clone());
+            for (got, want) in x.iter().zip(&whole.residual[n].2) {
+                assert!((got - want).abs() < 2e-5, "layer {n}: {got} vs {want}");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn projecting_the_last_residual_reproduces_the_returned_logits() -> Result<()> {
+        // Pins the logit lens to the model's own head: final norm, then output.
+        let model = tiny()?;
+        let mut rec = Recorder::default();
+        let logits = model.forward_observed(&[1, 2, 3, 4], &mut model.new_state(), &mut rec)?;
+        let (_, dims, last) = rec.residual.last().unwrap();
+        let x = Tensor::from_vec(last.clone(), dims.clone(), &Device::Cpu)?;
+        let lens = model.project(&x)?;
+        assert_eq!(lens.dims(), &[1, 4, 16]);
+        assert_eq!(flat(&lens.i((.., 3, ..))?)?, flat(&logits)?);
+        // An earlier layer is a different read, or the lens shows nothing.
+        let (_, dims, first) = &rec.residual[0];
+        let early = model.project(&Tensor::from_vec(first.clone(), dims.clone(), &Device::Cpu)?)?;
+        assert_ne!(flat(&early.i((.., 3, ..))?)?, flat(&logits)?);
+        assert!(model.project(&Tensor::zeros((1, 4, 7), DType::F32, &Device::Cpu)?).is_err());
+        Ok(())
+    }
+
+    /// The experts layer `layer` chose at every position of one forward.
+    fn chosen(model: &Model, tokens: &[u32], steering: &Steering, layer: usize) -> Result<Vec<Vec<u32>>> {
+        let mut rec = Recorder::default();
+        model.forward_steered(tokens, &mut model.new_state(), steering, Some(&mut rec))?;
+        Ok(rec.routing.into_iter().find(|r| r.0 == layer).unwrap().2)
+    }
+
+    #[test]
+    fn steering_with_the_models_own_bias_changes_nothing() -> Result<()> {
+        let model = tiny()?;
+        let mut steering = Steering::default();
+        for layer in [1, 2] {
+            steering.set_bias(layer, model.router_bias(layer).unwrap().clone());
+        }
+        let (mut plain, mut steered) = (model.new_state(), model.new_state());
+        let a = model.forward(&[1, 2, 3, 4, 5], &mut plain)?;
+        let b = model.forward_steered(&[1, 2, 3, 4, 5], &mut steered, &steering, None)?;
+        assert_eq!(flat(&a)?, flat(&b)?);
+        let empty = Steering::default();
+        let c = model.forward_steered(&[1, 2, 3, 4, 5], &mut model.new_state(), &empty, None)?;
+        assert_eq!(flat(&a)?, flat(&c)?);
+        Ok(())
+    }
+
+    #[test]
+    fn a_large_negative_bias_knocks_an_expert_out_and_a_large_positive_one_forces_it_in() -> Result<()> {
+        let model = tiny()?;
+        let tokens = [1u32, 2, 3, 4, 5];
+        let baseline = chosen(&model, &tokens, &Steering::default(), 1)?;
+        // An expert the router really uses, so removing it has to change something.
+        let used = baseline[0][0];
+        let bias = model.router_bias(1).unwrap().to_vec1::<f32>()?;
+        let with = |delta: f32| -> Result<Steering> {
+            let mut b = bias.clone();
+            b[used as usize] += delta;
+            let mut s = Steering::default();
+            s.set_bias(1, Tensor::from_vec(b, 3, &Device::Cpu)?);
+            Ok(s)
+        };
+        let out = chosen(&model, &tokens, &with(-1e4)?, 1)?;
+        assert!(out.iter().all(|row| !row.contains(&used)), "{out:?}");
+        // Three experts choosing two: with one banned, the other two are chosen everywhere.
+        assert!(out.iter().all(|row| row.len() == 2));
+        let forced = chosen(&model, &tokens, &with(1e4)?, 1)?;
+        assert!(forced.iter().all(|row| row.contains(&used)), "{forced:?}");
+        // Layer 2 was not steered, but it reads a residual layer 1 changed.
+        let plain = model.forward(&tokens, &mut model.new_state())?;
+        let steered = model.forward_steered(&tokens, &mut model.new_state(), &with(-1e4)?, None)?;
+        assert_ne!(flat(&plain)?, flat(&steered)?);
+        Ok(())
+    }
+
+    #[test]
+    fn a_forced_expert_is_weighted_by_its_own_score_not_by_the_bias() -> Result<()> {
+        let model = tiny()?;
+        let bias = model.router_bias(2).unwrap().to_vec1::<f32>()?;
+        let mut b = bias.clone();
+        b[0] += 1e4;
+        let mut steering = Steering::default();
+        steering.set_bias(2, Tensor::from_vec(b, 3, &Device::Cpu)?);
+        let mut rec = Recorder::default();
+        model.forward_steered(&[1, 2, 3], &mut model.new_state(), &steering, Some(&mut rec))?;
+        let (_, logits, ids, weights) = rec.routing.iter().find(|r| r.0 == 2).unwrap();
+        for ((l, i), w) in logits.iter().zip(ids).zip(weights) {
+            let s: Vec<f32> = i.iter().map(|&e| 1. / (1. + (-l[e as usize]).exp())).collect();
+            for (got, score) in w.iter().zip(&s) {
+                assert!((got - score / (s[0] + s[1] + 1e-6)).abs() < 1e-6, "{got}");
+                assert!(*got < 1.0);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn steering_that_cannot_apply_is_refused_and_commits_nothing() -> Result<()> {
+        let model = tiny()?;
+        let mut state = model.new_state();
+        model.forward(&[1, 2, 3], &mut state)?;
+        let bad = |layer: usize, t: Tensor| {
+            let mut s = Steering::default();
+            s.set_bias(layer, t);
+            s
+        };
+        let d = Device::Cpu;
+        // Layer 0 is dense, layer 9 does not exist, and a router has 3 experts here.
+        for steering in [
+            bad(0, Tensor::zeros(3, DType::F32, &d)?),
+            bad(9, Tensor::zeros(3, DType::F32, &d)?),
+            bad(1, Tensor::zeros(4, DType::F32, &d)?),
+            bad(1, Tensor::zeros(3, DType::F64, &d)?),
+        ] {
+            assert!(model.forward_steered(&[4, 5], &mut state, &steering, None).is_err());
+            assert_eq!(state.len(), 3);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn failing_observer_fails_the_forward_and_does_not_commit_state() -> Result<()> {
+        let model = tiny()?;
+        let mut state = model.new_state();
+        model.forward(&[1, 2, 3], &mut state)?;
+        let mut rec = Recorder {
+            fail_at_layer: Some(1),
+            ..Default::default()
+        };
+        assert!(model.forward_observed(&[4, 5], &mut state, &mut rec).is_err());
+        assert_eq!(state.len(), 3);
+        let a = model.forward(&[4, 5], &mut state)?;
+        let cold = model.forward(&[1, 2, 3, 4, 5], &mut model.new_state())?;
+        for (got, want) in flat(&a)?.iter().zip(flat(&cold)?) {
+            assert!((got - want).abs() < 2e-5, "{got} vs {want}");
+        }
+        Ok(())
+    }
+
     #[test]
     fn failure_after_all_layers_does_not_commit_state() -> Result<()> {
         check_failed_forward(false)
@@ -837,7 +1297,7 @@ mod tests {
                 topk: 2,
             };
             GROUPED_ROUTE_CALLS.with(|c| c.set((0, 0)));
-            let actual = moe.forward(&x)?;
+            let actual = moe.forward(&x, None, None)?;
             GROUPED_ROUTE_CALLS.with(|c| assert_eq!(c.get(), (1, projections)));
             let flat = x.reshape((17, 256))?;
             let (ids, weights) = route(&moe.gate.forward(&flat)?, &moe.bias, moe.topk)?;
