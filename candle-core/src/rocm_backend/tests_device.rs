@@ -145,3 +145,15 @@ fn a_downstream_rocblas_call_runs_through_the_handle() -> Result<()> {
     assert_eq!(out, expected);
     Ok(())
 }
+
+/// A downstream identity (lfm2d's `snapshot_id`) has to tell two AMD
+/// generations apart, since the kernels branch on the architecture
+/// (`RDNA2`/`RDNA3` MMQ geometry). The device reports the same target it
+/// compiles for, and the HIP toolchain it compiles with.
+#[test]
+fn the_device_reports_its_architecture_and_toolchain() -> Result<()> {
+    let dev = rocm_dev!();
+    assert!(dev.arch().starts_with("gfx"), "not an AMD target: {}", dev.arch());
+    assert!(!dev.hip_version().is_empty(), "no HIP version");
+    Ok(())
+}

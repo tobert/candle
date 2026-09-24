@@ -70,6 +70,8 @@ pub struct KernelCache {
     cache_dir: PathBuf,
     src_dir: PathBuf,
     arch: String,
+    /// The short HIP version (`7.2`), as the cache directory names it.
+    version_tag: String,
     /// Full `hipcc --version` output; part of the cache key.
     toolchain: String,
     /// Keyed by module identity, i.e. one entry per translation unit. Keying
@@ -121,6 +123,7 @@ impl KernelCache {
             cache_dir,
             src_dir,
             arch,
+            version_tag,
             toolchain,
             modules: RwLock::new(HashMap::new()),
             compiling: Mutex::new(HashMap::new()),
@@ -132,6 +135,17 @@ impl KernelCache {
     /// same set, so the host cannot assume one.
     pub fn mmq_tiles(&self) -> MmqTiles {
         detect::mmq_tiles(&self.arch)
+    }
+
+    /// The target this cache compiles for, as the device reports it
+    /// (`gcnArchName`, target features included: `gfx1151`, `gfx90a:xnack-`).
+    pub fn arch(&self) -> &str {
+        &self.arch
+    }
+
+    /// The short HIP toolchain version the kernels are compiled with (`7.2`).
+    pub fn hip_version(&self) -> &str {
+        &self.version_tag
     }
 
     /// Return the loaded module, compiling it if this is the first use.

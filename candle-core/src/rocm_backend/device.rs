@@ -168,6 +168,18 @@ impl RocmDevice {
     ///
     /// The returned [`RocmBlas`] carries the stream the handle is bound to and
     /// offers no way to rebind it; see its docs for why that matters.
+    /// The GPU target this device's kernels are compiled for (`gfx1151`).
+    /// Kernels branch on it, so numbers measured on one target are not
+    /// promised on another: an identity that pins results should carry it.
+    pub fn arch(&self) -> &str {
+        self.kernel_manager.arch()
+    }
+
+    /// The short HIP toolchain version the kernels are compiled with.
+    pub fn hip_version(&self) -> &str {
+        self.kernel_manager.hip_version()
+    }
+
     pub fn rocblas_handle(&self) -> RocmBlas {
         RocmBlas::new(self.blas.clone(), self.stream.clone())
     }
