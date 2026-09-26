@@ -469,6 +469,47 @@ mod rocm_real {
             .unwrap()
     }
 
+    /// Every kernel on the batched path computes each row on its own, so a
+    /// row's bits cannot depend on where it sits in the batch. Reversing the
+    /// rows over several steps catches any row mixing (a convolution state or
+    /// KV written to or read from the wrong row) that would otherwise pass as
+    /// batch-size drift. B = 3 takes MMVQ, B = 12 MMQ and task-major experts.
+    #[test]
+    #[ignore = "requires ROCm and LFM25_GGUF; device failure is an error"]
+    fn rocm_rows_are_position_invariant_over_several_steps() -> Result<()> {
+        let device = Device::new_rocm(0)?;
+        let model = load(&device)?;
+        for b in [3usize, 12] {
+            // Different lengths and contents per row.
+            let base: Vec<State> = (0..b)
+                .map(|i| {
+                    let text: Vec<u32> = (0..40 + 7 * i as u32)
+                        .map(|j| 500 + (j * 131 + i as u32 * 977) % 30000)
+                        .collect();
+                    prefill(&model, &text, &[text.len()]).map(|mut v| v.remove(0))
+                })
+                .collect::<Result<_>>()?;
+            let mut fwd = base.clone();
+            let mut rev: Vec<State> = base.iter().rev().cloned().collect();
+            let mut tokens: Vec<u32> = (0..b as u32).map(|i| 1000 + 17 * i).collect();
+            for step in 0..6 {
+                let mut a: Vec<&mut State> = fwd.iter_mut().collect();
+                let x = host_rows(&model.decode_batch(&tokens, &mut a)?)?;
+                let rtokens: Vec<u32> = tokens.iter().rev().copied().collect();
+                let mut r: Vec<&mut State> = rev.iter_mut().collect();
+                let y = host_rows(&model.decode_batch(&rtokens, &mut r)?)?;
+                for i in 0..b {
+                    assert!(
+                        x[i] == y[b - 1 - i],
+                        "B={b} step {step}: row {i} depends on its position"
+                    );
+                }
+                tokens = x.iter().map(|row| argmax(row)).collect();
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     #[ignore = "requires ROCm and LFM25_GGUF; device failure is an error"]
     fn rocm_batch_of_one_is_bit_identical_and_siblings_match_independent_rows() -> Result<()> {
