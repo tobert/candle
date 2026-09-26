@@ -5,6 +5,7 @@
 //! A failed forward leaves its input state's visible data and position unchanged.
 //! Snapshots are process-local and tied to the loaded model instance.
 mod attention;
+mod batch;
 mod kv_cache;
 
 use self::kv_cache::KvCache;

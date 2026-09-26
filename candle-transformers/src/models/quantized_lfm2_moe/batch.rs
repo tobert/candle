@@ -1,0 +1,742 @@
+//! Batched decode: one new token for each of several independent states.
+//!
+//! Everything whose cost is reading weights runs once for the whole batch:
+//! embedding, norms, QKV and output projections, the gated convolution (each
+//! row with its own convolution state), router, experts and output head.
+//! Attention runs per row against that row's own KV, because the rows'
+//! lengths differ and only a few layers have attention.
+//!
+//! Batch size selects the quantized kernel (on ROCm, B = 1 takes DMMV for
+//! K-quants, 2..=8 MMVQ, larger MMQ), so a row's logits at B > 1 are a
+//! different measurement from the batch-1 ones, not a reproduction of them.
+use super::kv_cache::KvCache;
+use super::{attention, AttentionLayer, Model, Operator, ShortConv, State};
+use candle::{bail, IndexOp, Module, Result, Tensor};
+
+impl AttentionLayer {
+    /// `xs` `(B, 1, hidden)`; row `i` sits at `positions` (a `(B,)` u32 tensor
+    /// on the device) and appends to `kv[i]`, whose length must be `pos[i]`.
+    fn decode_batch(
+        &self,
+        xs: &Tensor,
+        pos: &[usize],
+        positions: &Tensor,
+        kv: &mut [&mut Option<KvCache>],
+    ) -> Result<Tensor> {
+        let _enter = self.span_attn.enter();
+        let (b, _, n_embd) = xs.dims3()?;
+        let (q, k, v) = self.qkv.forward(xs)?;
+        let q = q
+            .reshape((b, 1, self.n_head, self.head_dim))?
+            .transpose(1, 2)?;
+        let k = k
+            .reshape((b, 1, self.n_kv_head, self.head_dim))?
+            .transpose(1, 2)?;
+        let v = v
+            .reshape((b, 1, self.n_kv_head, self.head_dim))?
+            .transpose(1, 2)?
+            .contiguous()?;
+        let q = self.q_norm.forward(&q.contiguous()?)?;
+        let k = self.k_norm.forward(&k.contiguous()?)?;
+        // Each row's own RoPE angle: (B, 1, head_dim / 2) rows of the table.
+        let rope = |x: &Tensor| -> Result<Tensor> {
+            let _enter = self.span_rot.enter();
+            let half = self.head_dim / 2;
+            let cos = self.cos.index_select(positions, 0)?.reshape((b, 1, half))?;
+            let sin = self.sin.index_select(positions, 0)?.reshape((b, 1, half))?;
+            candle_nn::rotary_emb::rope(&x.contiguous()?, &cos, &sin)
+        };
+        let q = rope(&q)?;
+        let k = rope(&k)?;
+        let limit = self.cos.dim(0)?;
+        let mut ys = Vec::with_capacity(b);
+        for (i, cache) in kv.iter_mut().enumerate() {
+            if cache.as_ref().map_or(0, KvCache::len) != pos[i] {
+                bail!("LFM2 KV position does not match state")
+            }
+            let next = KvCache::append(
+                cache.as_ref(),
+                &k.narrow(0, i, 1)?,
+                &v.narrow(0, i, 1)?,
+                limit,
+            )?;
+            let (ki, vi) = next.current()?;
+            **cache = Some(next);
+            ys.push(attention::forward(
+                &q.narrow(0, i, 1)?,
+                &ki,
+                &vi,
+                None,
+                &self.neg_inf,
+            )?);
+        }
+        let y = Tensor::cat(&ys, 0)?;
+        let y = y.transpose(1, 2)?.reshape((b, 1, n_embd))?;
+        self.wo.forward(&y)
+    }
+}
+
+impl ShortConv {
+    /// `x` `(B, 1, hidden)`; row `i` reads and replaces `state[i]`.
+    fn decode_batch(&self, x: &Tensor, state: &mut [&mut Option<Tensor>]) -> Result<Tensor> {
+        let h = x.dim(2)?;
+        let k = self.weight.dim(1)?;
+        let projected = self.input.forward(x)?;
+        let previous = state
+            .iter()
+            .map(|s| match s.as_ref() {
+                Some(s) => Ok(s.clone()),
+                None => Tensor::zeros((1, h, k), x.dtype(), x.device()),
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let previous = Tensor::cat(&previous, 0)?;
+        let (out, next) = candle_nn::lfm2::short_conv_step(&projected, &self.weight, &previous)?;
+        for (i, s) in state.iter_mut().enumerate() {
+            **s = Some(next.narrow(0, i, 1)?);
+        }
+        self.output.forward(&out)
+    }
+}
+
+impl Model {
+    /// One decode step for `B = tokens.len()` independent sequences: `tokens[i]`
+    /// continues `states[i]`. Returns next-token logits `(B, vocab)`, row `i`
+    /// for `states[i]`. States may have different lengths and may share
+    /// prefixes (branches of one parent); every state keeps the branch
+    /// semantics of [`Model::forward`]. Validation happens before anything
+    /// runs, and either every state commits or none does.
+    ///
+    /// B = 1 runs the same operations as `forward(&[token], state)` and gives
+    /// bit-identical logits and state. Observation and steering are not
+    /// offered here; use [`Model::forward_observed`] per sequence.
+    pub fn decode_batch(&self, tokens: &[u32], states: &mut [&mut State]) -> Result<Tensor> {
+        let b = tokens.len();
+        if b == 0 {
+            bail!("decode_batch needs at least one sequence")
+        }
+        if states.len() != b {
+            bail!("decode_batch has {b} tokens for {} states", states.len())
+        }
+        for (i, (s, &t)) in states.iter().zip(tokens).enumerate() {
+            if !self.owns_state(s) {
+                bail!("row {i}: snapshot belongs to another model")
+            }
+            if s.len >= self.context {
+                bail!("row {i}: context limit exceeded")
+            }
+            if t as usize >= self.vocab {
+                bail!("row {i}: token outside model vocabulary")
+            }
+        }
+        let pos: Vec<usize> = states.iter().map(|s| s.len).collect();
+        let positions = Tensor::from_iter(pos.iter().map(|&p| p as u32), &self.device)?;
+        let mut next: Vec<State> = states.iter().map(|s| (**s).clone()).collect();
+        let ids = Tensor::from_slice(tokens, (b, 1), &self.device)?;
+        let mut x = self.embedding.embedding(&ids)?;
+        for (i, layer) in self.layers.iter().enumerate() {
+            let normed = layer.norm.forward(&x)?;
+            let y = match &layer.operator {
+                Operator::Attention(a) => {
+                    let mut kv: Vec<_> = next.iter_mut().map(|s| &mut s.kv[i]).collect();
+                    a.decode_batch(&normed, &pos, &positions, &mut kv)?
+                }
+                Operator::Conv(c) => {
+                    let mut conv: Vec<_> = next.iter_mut().map(|s| &mut s.conv[i]).collect();
+                    c.decode_batch(&normed, &mut conv)?
+                }
+            };
+            x = (x + y)?;
+            x = (&x
+                + layer
+                    .ffn
+                    .forward(&layer.ffn_norm.forward(&x)?, None, None)?)?;
+        }
+        let x = self.norm.forward(&x)?.i((.., 0, ..))?.contiguous()?;
+        let logits = self.output.forward(&x)?;
+        for (s, mut n) in states.iter_mut().zip(next) {
+            n.len += 1;
+            **s = n;
+        }
+        Ok(logits)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle::quantized::{gguf_file, QMatMul};
+    use candle::{DType, Device};
+
+    fn tiny() -> Result<Model> {
+        let mut f =
+            std::io::Cursor::new(include_bytes!("../../../tests/fixtures/lfm2-moe/tiny.gguf"));
+        let ct = gguf_file::Content::read(&mut f)?;
+        Model::from_gguf(ct, &mut f, &Device::Cpu)
+    }
+    fn rows(t: &Tensor) -> Result<Vec<Vec<f32>>> {
+        t.to_vec2::<f32>()
+    }
+    fn prefilled(model: &Model, tokens: &[u32]) -> Result<State> {
+        let mut s = model.new_state();
+        if !tokens.is_empty() {
+            model.forward(tokens, &mut s)?;
+        }
+        Ok(s)
+    }
+    fn max_abs(a: &[f32], b: &[f32]) -> f32 {
+        assert_eq!(a.len(), b.len());
+        a.iter()
+            .zip(b)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0., f32::max)
+    }
+    /// What a batch-1 step gives on a copy of `state`, plus the next step after
+    /// it, so a test can check both the logits and the committed state.
+    fn single(model: &Model, state: &State, t: u32, then: u32) -> Result<(Vec<f32>, Vec<f32>)> {
+        let mut s = state.clone();
+        let a = model.forward(&[t], &mut s)?.flatten_all()?.to_vec1()?;
+        let b = model.forward(&[then], &mut s)?.flatten_all()?.to_vec1()?;
+        Ok((a, b))
+    }
+
+    // Tiny fixture on CPU: plain f32 weights, so every op is the same maths at
+    // B rows as at one. The tolerance is tight; the measured value is printed.
+    const CPU_TOL: f32 = 1e-5;
+
+    #[test]
+    fn mixed_lengths_match_per_row_single_steps_and_commit_the_same_state() -> Result<()> {
+        let model = tiny()?;
+        // Lengths 0 (a first token), 1, 3 and 7: conv state absent and
+        // present, KV at several positions, different RoPE angles per row.
+        let prefixes: [&[u32]; 4] = [&[], &[5], &[1, 2, 3], &[9, 8, 7, 6, 5, 4, 3]];
+        let tokens = [11u32, 2, 4, 15];
+        let mut states: Vec<State> = prefixes
+            .iter()
+            .map(|p| prefilled(&model, p))
+            .collect::<Result<_>>()?;
+        let expected: Vec<_> = states
+            .iter()
+            .zip(tokens)
+            .map(|(s, t)| single(&model, s, t, 7))
+            .collect::<Result<_>>()?;
+        let mut refs: Vec<&mut State> = states.iter_mut().collect();
+        let got = model.decode_batch(&tokens, &mut refs)?;
+        assert_eq!(got.dims(), &[4, model.vocab_size()]);
+        let got = rows(&got)?;
+        let mut worst = 0f32;
+        for (i, (row, (want, _))) in got.iter().zip(&expected).enumerate() {
+            let d = max_abs(row, want);
+            assert!(d < CPU_TOL, "row {i}: max |delta| {d}");
+            worst = worst.max(d);
+        }
+        eprintln!("cpu batched vs batch-1 max |delta logit| = {worst:e}");
+        for (i, (s, (_, then))) in states.iter_mut().zip(&expected).enumerate() {
+            assert_eq!(s.len(), prefixes[i].len() + 1);
+            let next = model.forward(&[7], s)?.flatten_all()?.to_vec1::<f32>()?;
+            assert!(max_abs(&next, then) < CPU_TOL, "row {i} committed state");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn repeated_batched_steps_track_single_step_decoding() -> Result<()> {
+        // Several consecutive batched steps, so a row reads conv/KV state that
+        // an earlier batched step wrote, not only state from a batch-1 prefill.
+        let model = tiny()?;
+        let mut batched: Vec<State> = [&[1u32, 2][..], &[3, 4, 5, 6, 7]]
+            .iter()
+            .map(|p| prefilled(&model, p))
+            .collect::<Result<_>>()?;
+        let mut singles = batched.clone();
+        for step in 0..6u32 {
+            let tokens = [step % 16, (step * 5 + 3) % 16];
+            let mut refs: Vec<&mut State> = batched.iter_mut().collect();
+            let got = rows(&model.decode_batch(&tokens, &mut refs)?)?;
+            for (i, s) in singles.iter_mut().enumerate() {
+                let want = model
+                    .forward(&[tokens[i]], s)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?;
+                let d = max_abs(&got[i], &want);
+                assert!(d < CPU_TOL, "step {step} row {i}: {d}");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_batch_of_one_is_bit_identical_to_forward() -> Result<()> {
+        let model = tiny()?;
+        for prefix in [&[][..], &[3], &[1, 2, 3, 4, 5]] {
+            let mut a = prefilled(&model, prefix)?;
+            let mut b = a.clone();
+            let want = model.forward(&[9], &mut a)?;
+            let got = model.decode_batch(&[9], &mut [&mut b])?;
+            assert_eq!(got.dims(), want.dims());
+            assert_eq!(rows(&got)?, rows(&want)?);
+            // And the committed state is the same state, bit for bit.
+            assert_eq!(
+                rows(&model.forward(&[4, 2], &mut a)?)?,
+                rows(&model.forward(&[4, 2], &mut b)?)?
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn siblings_of_one_parent_decode_together_without_touching_each_other() -> Result<()> {
+        let model = tiny()?;
+        let parent = prefilled(&model, &[1, 2, 3, 4])?;
+        // Before anything else touches the parent: its own continuations.
+        let parent_next = single(&model, &parent, 6, 1)?;
+        let mut a = parent.clone();
+        let mut b = parent.clone();
+        // c is a sibling that already ran ahead: it holds a reservation past
+        // the parent's length in the shared KV storage.
+        let mut c = parent.clone();
+        model.forward(&[10, 11], &mut c)?;
+        let a_want = single(&model, &a, 6, 12)?;
+        let b_want = single(&model, &b, 13, 14)?;
+        let c_want = single(&model, &c, 2, 3)?;
+        let mut p = parent.clone();
+        let p_want = single(&model, &p, 8, 9)?;
+        let got =
+            rows(&model.decode_batch(&[6, 13, 2, 8], &mut [&mut a, &mut b, &mut c, &mut p])?)?;
+        for (i, want) in [&a_want, &b_want, &c_want, &p_want].iter().enumerate() {
+            assert!(max_abs(&got[i], &want.0) < CPU_TOL, "row {i}");
+        }
+        // Each committed branch continues as a batch-1 branch would.
+        for (i, (s, t, want)) in [
+            (&mut a, 12, &a_want),
+            (&mut b, 14, &b_want),
+            (&mut c, 3, &c_want),
+            (&mut p, 9, &p_want),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let next = model.forward(&[t], s)?.flatten_all()?.to_vec1::<f32>()?;
+            assert!(max_abs(&next, &want.1) < CPU_TOL, "row {i} after the batch");
+        }
+        // The parent is untouched by four branches writing past it.
+        assert_eq!(parent.len(), 4);
+        let again = single(&model, &parent, 6, 1)?;
+        assert_eq!(again, parent_next);
+        Ok(())
+    }
+
+    #[test]
+    fn bad_input_fails_loudly_and_commits_nothing() -> Result<()> {
+        let model = tiny()?;
+        let other = tiny()?;
+        let base = prefilled(&model, &[1, 2, 3])?;
+        let want = single(&model, &base, 4, 5)?;
+        let context = model.context_length();
+        let full = prefilled(&model, &vec![1u32; context])?;
+        let foreign = prefilled(&other, &[1])?;
+        let cases: Vec<(&str, Vec<u32>, Vec<State>)> = vec![
+            ("empty batch", vec![], vec![]),
+            (
+                "fewer tokens than states",
+                vec![4],
+                vec![base.clone(), base.clone()],
+            ),
+            ("more tokens than states", vec![4, 4], vec![base.clone()]),
+            (
+                "token outside vocabulary",
+                vec![4, 16],
+                vec![base.clone(), base.clone()],
+            ),
+            (
+                "state at the context limit",
+                vec![4, 4],
+                vec![base.clone(), full.clone()],
+            ),
+            (
+                "state from another model",
+                vec![4, 4],
+                vec![base.clone(), foreign.clone()],
+            ),
+        ];
+        for (what, tokens, mut states) in cases {
+            let lens: Vec<usize> = states.iter().map(State::len).collect();
+            let mut refs: Vec<&mut State> = states.iter_mut().collect();
+            assert!(
+                model.decode_batch(&tokens, &mut refs).is_err(),
+                "{what} accepted"
+            );
+            assert_eq!(
+                states.iter().map(State::len).collect::<Vec<_>>(),
+                lens,
+                "{what}"
+            );
+            // The valid rows beside the bad one are still exactly usable.
+            if let Some(s) = states.first() {
+                if s.len() == 3 {
+                    assert_eq!(single(&model, s, 4, 5)?, want, "{what}");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_failure_inside_the_forward_commits_no_row() -> Result<()> {
+        let mut model = tiny()?;
+        let mut a = prefilled(&model, &[1, 2, 3])?;
+        let mut b = prefilled(&model, &[4])?;
+        let (a_want, b_want) = (single(&model, &a, 5, 6)?, single(&model, &b, 7, 8)?);
+        let broken = QMatMul::Tensor(Tensor::zeros((1, 1), DType::F32, &Device::Cpu)?);
+        let good = std::mem::replace(&mut model.output, broken);
+        assert!(model.decode_batch(&[5, 7], &mut [&mut a, &mut b]).is_err());
+        model.output = good;
+        assert_eq!((a.len(), b.len()), (3, 1));
+        assert_eq!(single(&model, &a, 5, 6)?, a_want);
+        assert_eq!(single(&model, &b, 7, 8)?, b_want);
+        // And a retry of the same batch on the same states succeeds exactly.
+        let got = rows(&model.decode_batch(&[5, 7], &mut [&mut a, &mut b])?)?;
+        assert!(max_abs(&got[0], &a_want.0) < CPU_TOL);
+        assert!(max_abs(&got[1], &b_want.0) < CPU_TOL);
+        Ok(())
+    }
+}
+
+/// Real-checkpoint tests and the batched-decode bench, on ROCm. Both need
+/// `LFM25_GGUF` (the LFM2.5-8B-A1B GGUF); the bench also needs `LFM25_PROMPTS`
+/// (JSON `{"prompts": [[token ids]...], "sha256": ...}`) and writes its record
+/// to `LFM25_BENCH_OUT`. Missing inputs are an error, never a skip.
+#[cfg(all(test, feature = "rocm"))]
+mod rocm_real {
+    use super::*;
+    use candle::quantized::gguf_file;
+    use candle::{Device, D};
+    use std::time::Instant;
+
+    fn env(key: &str) -> String {
+        std::env::var(key).unwrap_or_else(|_| panic!("set {key}"))
+    }
+    fn load(device: &Device) -> Result<Model> {
+        let path = env("LFM25_GGUF");
+        let mut f = std::fs::File::open(&path)?;
+        let ct = gguf_file::Content::read(&mut f)?;
+        Model::from_gguf(ct, &mut f, device)
+    }
+    /// Abort anything large before the host runs short: the GPU here shares
+    /// system memory.
+    fn memory_guard() -> Result<u64> {
+        let info = std::fs::read_to_string("/proc/meminfo")?;
+        let kib: u64 = info
+            .lines()
+            .find(|l| l.starts_with("MemAvailable:"))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|v| v.parse().ok())
+            .expect("MemAvailable in /proc/meminfo");
+        if kib < 6 * 1024 * 1024 {
+            bail!("memory guard: MemAvailable {kib} KiB is under 6 GiB")
+        }
+        Ok(kib)
+    }
+    fn prefill(model: &Model, tokens: &[u32], stops: &[usize]) -> Result<Vec<State>> {
+        // Chunked like a server; returns a snapshot at every requested length.
+        let mut state = model.new_state();
+        let mut snaps = Vec::new();
+        let mut done = 0;
+        for &stop in stops {
+            while done < stop {
+                memory_guard()?;
+                let n = (stop - done).min(512);
+                model.forward(&tokens[done..done + n], &mut state)?;
+                done += n;
+            }
+            snaps.push(state.clone());
+        }
+        Ok(snaps)
+    }
+    fn host_rows(t: &Tensor) -> Result<Vec<Vec<f32>>> {
+        t.to_device(&Device::Cpu)?.to_vec2::<f32>()
+    }
+    fn log_softmax(row: &[f32]) -> Vec<f64> {
+        let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
+        let sum: f64 = row.iter().map(|&v| (v as f64 - max).exp()).sum();
+        let lse = max + sum.ln();
+        row.iter().map(|&v| v as f64 - lse).collect()
+    }
+    fn argmax(row: &[f32]) -> u32 {
+        row.iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .map(|(i, _)| i as u32)
+            .unwrap()
+    }
+
+    #[test]
+    #[ignore = "requires ROCm and LFM25_GGUF; device failure is an error"]
+    fn rocm_batch_of_one_is_bit_identical_and_siblings_match_independent_rows() -> Result<()> {
+        let device = Device::new_rocm(0)?;
+        let model = load(&device)?;
+        let text: Vec<u32> = (0..200u32).map(|i| 1000 + (i * 7919) % 20000).collect();
+        // B = 1: same kernels as forward, so the same bits, state included.
+        let mut a = prefill(&model, &text, &[150])?.remove(0);
+        let mut b = a.clone();
+        let want = host_rows(&model.forward(&[text[150]], &mut a)?)?;
+        let got = host_rows(&model.decode_batch(&[text[150]], &mut [&mut b])?)?;
+        assert_eq!(got, want, "B=1 logits");
+        assert_eq!(
+            host_rows(&model.forward(&[text[151]], &mut a)?)?,
+            host_rows(&model.forward(&[text[151]], &mut b)?)?,
+            "B=1 committed state"
+        );
+        // Four branches of one parent (shared KV storage, one of them already
+        // ahead of the parent) against four rows prefilled independently: the
+        // batch composition is identical, so the bits must be too.
+        let parent = prefill(&model, &text, &[120])?.remove(0);
+        let parent_next = host_rows(&model.forward(&[5], &mut parent.clone())?)?;
+        let mut ahead = parent.clone();
+        model.forward(&text[120..123], &mut ahead)?;
+        let mut shared = [parent.clone(), parent.clone(), ahead, parent.clone()];
+        // Built by the same chunking as its twin: chunk shape selects kernels.
+        let mut fresh_ahead = prefill(&model, &text, &[120])?.remove(0);
+        model.forward(&text[120..123], &mut fresh_ahead)?;
+        let mut fresh = [
+            prefill(&model, &text, &[120])?.remove(0),
+            prefill(&model, &text, &[120])?.remove(0),
+            fresh_ahead,
+            prefill(&model, &text, &[120])?.remove(0),
+        ];
+        let tokens = [7u32, 8, 9, 10];
+        for step in 0..3 {
+            let [s0, s1, s2, s3] = &mut shared;
+            let x = host_rows(&model.decode_batch(&tokens, &mut [s0, s1, s2, s3])?)?;
+            let [f0, f1, f2, f3] = &mut fresh;
+            let y = host_rows(&model.decode_batch(&tokens, &mut [f0, f1, f2, f3])?)?;
+            for i in 0..4 {
+                assert!(
+                    x[i] == y[i],
+                    "step {step} row {i}: branch differs from its independent twin"
+                );
+            }
+        }
+        assert_eq!(parent.len(), 120);
+        assert_eq!(
+            host_rows(&model.forward(&[5], &mut parent.clone())?)?,
+            parent_next
+        );
+        Ok(())
+    }
+
+    #[derive(serde::Serialize, Default)]
+    struct Drift {
+        b: usize,
+        rows_x_steps: usize,
+        top1_agree: usize,
+        dtop1_nats_median: f64,
+        dtop1_nats_max: f64,
+        dtop20_nats_median: f64,
+        dtop20_nats_max: f64,
+    }
+    #[derive(serde::Serialize)]
+    struct Timing {
+        regime: String,
+        b: usize,
+        mean_ctx: f64,
+        steps: usize,
+        step_ms_p50: f64,
+        step_ms_p90: f64,
+        tok_per_s: f64,
+        serial_step_ms_p50: f64,
+        serial_tok_per_s: f64,
+        kv_bytes: usize,
+        device_used_delta_mib: f64,
+    }
+    fn pct(v: &mut [f64], p: f64) -> f64 {
+        v.sort_by(f64::total_cmp);
+        v[((v.len() - 1) as f64 * p).round() as usize]
+    }
+    fn device_used() -> f64 {
+        let m = candle::rocm_backend::rocm_rs::hip::memory::memory_info().unwrap();
+        (m.total - m.free) as f64 / (1u64 << 20) as f64
+    }
+    fn kv_bytes(model: &Model, states: &[State]) -> Result<usize> {
+        // Committed KV plus convolution state, at f32; capacity slack excluded.
+        let mut total = 0;
+        for s in states {
+            for (i, l) in model.layers.iter().enumerate() {
+                if let (Operator::Attention(a), Some(_)) = (&l.operator, &s.kv[i]) {
+                    total += 2 * a.n_kv_head * a.head_dim * s.len * 4;
+                }
+                if let Some(c) = &s.conv[i] {
+                    total += c.elem_count() * 4;
+                }
+            }
+        }
+        Ok(total)
+    }
+
+    #[test]
+    #[ignore = "bench: requires ROCm, LFM25_GGUF, LFM25_PROMPTS, LFM25_BENCH_OUT"]
+    fn rocm_decode_batch_bench() -> Result<()> {
+        let device = Device::new_rocm(0)?;
+        let used0 = device_used();
+        let model = load(&device)?;
+        let loaded = device_used();
+        let spec: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(env("LFM25_PROMPTS"))?).unwrap();
+        let prompts: Vec<Vec<u32>> = serde_json::from_value(spec["prompts"].clone()).unwrap();
+        let bs = [1usize, 2, 4, 8, 16, 32];
+        let t0 = Instant::now();
+        // Snapshots at 16, 512 and 2048 tokens (when the prompt reaches them)
+        // and one token short of the prompt's full length.
+        let mut snaps: Vec<Vec<State>> = Vec::new();
+        for p in &prompts {
+            let mut stops: Vec<usize> = [16, 512, 2048]
+                .into_iter()
+                .filter(|&s| s < p.len())
+                .collect();
+            stops.push(p.len() - 1);
+            snaps.push(prefill(&model, p, &stops)?);
+        }
+        let prefill_s = t0.elapsed().as_secs_f64();
+        let at = |len: usize| -> Vec<State> {
+            snaps
+                .iter()
+                .flatten()
+                .filter(|s| s.len() == len)
+                .cloned()
+                .collect()
+        };
+        let regimes: Vec<(String, Vec<State>)> = vec![
+            ("ctx16".into(), at(16)),
+            ("ctx512".into(), at(512)),
+            ("ctx2048".into(), at(2048)),
+            (
+                "mixed".into(),
+                snaps.iter().map(|s| s.last().unwrap().clone()).collect(),
+            ),
+        ];
+        eprintln!(
+            "prefill {prefill_s:.1}s for {} tokens",
+            prompts.iter().map(Vec::len).sum::<usize>()
+        );
+
+        // Drift: batched vs batch-1, teacher-forced on the batch-1 greedy token.
+        let mixed = &regimes[3].1;
+        let mut drift = Vec::new();
+        let steps = 8;
+        for &b in &bs {
+            let mut batched: Vec<State> = mixed[..b].to_vec();
+            let mut single: Vec<State> = mixed[..b].to_vec();
+            // The snapshots stop one token short: the first step feeds each
+            // prompt's real last token, later steps the batch-1 greedy token.
+            let mut tokens: Vec<u32> = (0..b).map(|i| *prompts[i].last().unwrap()).collect();
+            let (mut d1, mut d20, mut agree) = (Vec::new(), Vec::new(), 0);
+            for _ in 0..steps {
+                memory_guard()?;
+                let mut refs: Vec<&mut State> = batched.iter_mut().collect();
+                let got = host_rows(&model.decode_batch(&tokens, &mut refs)?)?;
+                for i in 0..b {
+                    let want = host_rows(&model.forward(&[tokens[i]], &mut single[i])?)?.remove(0);
+                    let (lw, lg) = (log_softmax(&want), log_softmax(&got[i]));
+                    let top = argmax(&want);
+                    agree += usize::from(argmax(&got[i]) == top);
+                    d1.push((lg[top as usize] - lw[top as usize]).abs());
+                    let mut order: Vec<usize> = (0..lw.len()).collect();
+                    order.select_nth_unstable_by(20, |a, b| lw[*b].total_cmp(&lw[*a]));
+                    d20.push(
+                        order[..20]
+                            .iter()
+                            .map(|&j| (lg[j] - lw[j]).abs())
+                            .fold(0., f64::max),
+                    );
+                    tokens[i] = top;
+                }
+            }
+            let n = d1.len();
+            let row = Drift {
+                b,
+                rows_x_steps: n,
+                top1_agree: agree,
+                dtop1_nats_median: pct(&mut d1, 0.5),
+                dtop1_nats_max: pct(&mut d1, 1.0),
+                dtop20_nats_median: pct(&mut d20, 0.5),
+                dtop20_nats_max: pct(&mut d20, 1.0),
+            };
+            eprintln!("drift B={b}: top1 {}/{n}, top1 |d| med {:.4} max {:.4}, top20 max|d| med {:.4} max {:.4}",
+                agree, row.dtop1_nats_median, row.dtop1_nats_max, row.dtop20_nats_median, row.dtop20_nats_max);
+            drift.push(row);
+        }
+
+        // Throughput: per-step wall time including the device-to-host read of
+        // each row's greedy token, which a real decode loop needs anyway.
+        let (warm, timed) = (3, 24);
+        let mut timing = Vec::new();
+        for (name, pool) in &regimes {
+            for &b in &bs {
+                memory_guard()?;
+                let rows: Vec<State> = (0..b).map(|i| pool[i % pool.len()].clone()).collect();
+                let mean_ctx = rows.iter().map(|s| s.len() as f64).sum::<f64>() / b as f64;
+                let mut batched = rows.clone();
+                let mut tokens = vec![1u32; b];
+                let mut ms = Vec::new();
+                for step in 0..warm + timed {
+                    let t = Instant::now();
+                    let mut refs: Vec<&mut State> = batched.iter_mut().collect();
+                    let logits = model.decode_batch(&tokens, &mut refs)?;
+                    tokens = logits.argmax(D::Minus1)?.to_vec1::<u32>()?;
+                    if step >= warm {
+                        ms.push(t.elapsed().as_secs_f64() * 1e3);
+                    }
+                }
+                let used = device_used();
+                let kv = kv_bytes(&model, &batched)?;
+                drop(batched);
+                // Serial baseline: the same rows, one batch-1 forward each.
+                let mut serial = rows.clone();
+                let mut stoks = vec![1u32; b];
+                let mut sms = Vec::new();
+                for step in 0..warm + timed / 2 {
+                    let t = Instant::now();
+                    for (i, s) in serial.iter_mut().enumerate() {
+                        let l = model.forward(&[stoks[i]], s)?;
+                        stoks[i] = l.argmax(D::Minus1)?.to_vec1::<u32>()?[0];
+                    }
+                    if step >= warm {
+                        sms.push(t.elapsed().as_secs_f64() * 1e3);
+                    }
+                }
+                let p50 = pct(&mut ms, 0.5);
+                let sp50 = pct(&mut sms, 0.5);
+                let row = Timing {
+                    regime: name.clone(),
+                    b,
+                    mean_ctx,
+                    steps: timed,
+                    step_ms_p50: p50,
+                    step_ms_p90: pct(&mut ms, 0.9),
+                    tok_per_s: b as f64 * 1e3 / p50,
+                    serial_step_ms_p50: sp50,
+                    serial_tok_per_s: b as f64 * 1e3 / sp50,
+                    kv_bytes: kv,
+                    device_used_delta_mib: used - loaded,
+                };
+                eprintln!("{name} B={b} ctx {mean_ctx:.0}: step p50 {p50:.2} ms p90 {:.2} -> {:.1} tok/s; serial {sp50:.2} ms -> {:.1} tok/s; kv {:.1} MiB",
+                    row.step_ms_p90, row.tok_per_s, row.serial_tok_per_s, kv as f64 / 1048576.);
+                timing.push(row);
+            }
+        }
+        let record = serde_json::json!({
+            "prompts_sha256": spec["sha256"],
+            "prompt_lengths": prompts.iter().map(Vec::len).collect::<Vec<_>>(),
+            "prefill_seconds": prefill_s,
+            "device_used_mib_before_load": used0,
+            "device_used_mib_after_load": loaded,
+            "drift_steps_teacher_forced": steps,
+            "drift": drift,
+            "timing": timing,
+        });
+        std::fs::write(
+            env("LFM25_BENCH_OUT"),
+            serde_json::to_string_pretty(&record).unwrap(),
+        )?;
+        Ok(())
+    }
+}
