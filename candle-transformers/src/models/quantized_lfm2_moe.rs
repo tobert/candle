@@ -472,25 +472,26 @@ struct ShortConv {
     weight: Tensor,
 }
 impl ShortConv {
-    fn forward(&self, x: &Tensor, state: &mut Option<Tensor>) -> Result<Tensor> {
+    fn forward(&self, x: &Tensor, state: &mut Option<ConvState>) -> Result<Tensor> {
         let h = x.dim(2)?;
         let projected = self.input.forward(x)?;
+        let previous = state.as_ref().map(ConvState::row).transpose()?;
         if x.dim(1)? == 1 {
-            let previous = match state.as_ref() {
-                Some(s) => s.clone(),
+            let previous = match previous {
+                Some(s) => s,
                 None => Tensor::zeros((x.dim(0)?, h, self.weight.dim(1)?), x.dtype(), x.device())?,
             };
             let (out, next) =
                 candle_nn::lfm2::short_conv_step(&projected, &self.weight, &previous)?;
-            *state = Some(next);
+            *state = Some(ConvState::single(next));
             return self.output.forward(&out);
         }
         let bcx = projected.transpose(1, 2)?;
         let b = bcx.narrow(1, 0, h)?;
         let c = bcx.narrow(1, h, h)?;
         let bx = (b * bcx.narrow(1, 2 * h, h)?)?;
-        let (conv, next) = causal_conv(&bx, &self.weight, state.as_ref())?;
-        *state = Some(next);
+        let (conv, next) = causal_conv(&bx, &self.weight, previous.as_ref())?;
+        *state = Some(ConvState::single(next));
         self.output
             .forward(&(c * conv)?.transpose(1, 2)?.contiguous()?)
     }
@@ -525,7 +526,33 @@ pub struct State {
     owner: Arc<()>,
     len: usize,
     kv: Vec<Option<KvCache>>,
-    conv: Vec<Option<Tensor>>,
+    conv: Vec<Option<ConvState>>,
+}
+
+/// One sequence's convolution state `(1, hidden, k)`: row `row` of the
+/// immutable `(rows, hidden, k)` tensor the step that wrote it produced. A
+/// batched step keeps the whole tensor so that the next batched step over the
+/// same states in the same order reads it as is, instead of gathering its rows
+/// again. A surviving state keeps its batch's tensor alive; it is small.
+#[derive(Debug, Clone)]
+struct ConvState {
+    rows: Tensor,
+    row: usize,
+}
+impl ConvState {
+    fn single(state: Tensor) -> Self {
+        Self {
+            rows: state,
+            row: 0,
+        }
+    }
+    fn row(&self) -> Result<Tensor> {
+        if self.rows.dim(0)? == 1 {
+            Ok(self.rows.clone())
+        } else {
+            self.rows.narrow(0, self.row, 1)
+        }
+    }
 }
 impl State {
     pub fn len(&self) -> usize {
@@ -614,9 +641,9 @@ impl Model {
         observer: Option<&mut dyn Observer>,
     ) -> Result<Tensor> {
         for (&layer, bias) in &steering.bias {
-            let own = self
-                .router_bias(layer)
-                .ok_or_else(|| candle::Error::Msg(format!("layer {layer} has no router to steer")))?;
+            let own = self.router_bias(layer).ok_or_else(|| {
+                candle::Error::Msg(format!("layer {layer} has no router to steer"))
+            })?;
             if bias.dims() != own.dims()
                 || bias.dtype() != own.dtype()
                 || !bias.device().same_device(own.device())
@@ -1056,9 +1083,18 @@ mod tests {
         assert_eq!(
             model.layers(),
             vec![
-                LayerInfo { attention: false, experts: None },
-                LayerInfo { attention: true, experts: moe },
-                LayerInfo { attention: false, experts: moe },
+                LayerInfo {
+                    attention: false,
+                    experts: None
+                },
+                LayerInfo {
+                    attention: true,
+                    experts: moe
+                },
+                LayerInfo {
+                    attention: false,
+                    experts: moe
+                },
             ]
         );
         assert_eq!(
@@ -1137,14 +1173,25 @@ mod tests {
         assert_eq!(flat(&lens.i((.., 3, ..))?)?, flat(&logits)?);
         // An earlier layer is a different read, or the lens shows nothing.
         let (_, dims, first) = &rec.residual[0];
-        let early = model.project(&Tensor::from_vec(first.clone(), dims.clone(), &Device::Cpu)?)?;
+        let early = model.project(&Tensor::from_vec(
+            first.clone(),
+            dims.clone(),
+            &Device::Cpu,
+        )?)?;
         assert_ne!(flat(&early.i((.., 3, ..))?)?, flat(&logits)?);
-        assert!(model.project(&Tensor::zeros((1, 4, 7), DType::F32, &Device::Cpu)?).is_err());
+        assert!(model
+            .project(&Tensor::zeros((1, 4, 7), DType::F32, &Device::Cpu)?)
+            .is_err());
         Ok(())
     }
 
     /// The experts layer `layer` chose at every position of one forward.
-    fn chosen(model: &Model, tokens: &[u32], steering: &Steering, layer: usize) -> Result<Vec<Vec<u32>>> {
+    fn chosen(
+        model: &Model,
+        tokens: &[u32],
+        steering: &Steering,
+        layer: usize,
+    ) -> Result<Vec<Vec<u32>>> {
         let mut rec = Recorder::default();
         model.forward_steered(tokens, &mut model.new_state(), steering, Some(&mut rec))?;
         Ok(rec.routing.into_iter().find(|r| r.0 == layer).unwrap().2)
@@ -1168,7 +1215,8 @@ mod tests {
     }
 
     #[test]
-    fn a_large_negative_bias_knocks_an_expert_out_and_a_large_positive_one_forces_it_in() -> Result<()> {
+    fn a_large_negative_bias_knocks_an_expert_out_and_a_large_positive_one_forces_it_in(
+    ) -> Result<()> {
         let model = tiny()?;
         let tokens = [1u32, 2, 3, 4, 5];
         let baseline = chosen(&model, &tokens, &Steering::default(), 1)?;
@@ -1204,10 +1252,18 @@ mod tests {
         let mut steering = Steering::default();
         steering.set_bias(2, Tensor::from_vec(b, 3, &Device::Cpu)?);
         let mut rec = Recorder::default();
-        model.forward_steered(&[1, 2, 3], &mut model.new_state(), &steering, Some(&mut rec))?;
+        model.forward_steered(
+            &[1, 2, 3],
+            &mut model.new_state(),
+            &steering,
+            Some(&mut rec),
+        )?;
         let (_, logits, ids, weights) = rec.routing.iter().find(|r| r.0 == 2).unwrap();
         for ((l, i), w) in logits.iter().zip(ids).zip(weights) {
-            let s: Vec<f32> = i.iter().map(|&e| 1. / (1. + (-l[e as usize]).exp())).collect();
+            let s: Vec<f32> = i
+                .iter()
+                .map(|&e| 1. / (1. + (-l[e as usize]).exp()))
+                .collect();
             for (got, score) in w.iter().zip(&s) {
                 assert!((got - score / (s[0] + s[1] + 1e-6)).abs() < 1e-6, "{got}");
                 assert!(*got < 1.0);
@@ -1234,7 +1290,9 @@ mod tests {
             bad(1, Tensor::zeros(4, DType::F32, &d)?),
             bad(1, Tensor::zeros(3, DType::F64, &d)?),
         ] {
-            assert!(model.forward_steered(&[4, 5], &mut state, &steering, None).is_err());
+            assert!(model
+                .forward_steered(&[4, 5], &mut state, &steering, None)
+                .is_err());
             assert_eq!(state.len(), 3);
         }
         Ok(())
@@ -1249,7 +1307,9 @@ mod tests {
             fail_at_layer: Some(1),
             ..Default::default()
         };
-        assert!(model.forward_observed(&[4, 5], &mut state, &mut rec).is_err());
+        assert!(model
+            .forward_observed(&[4, 5], &mut state, &mut rec)
+            .is_err());
         assert_eq!(state.len(), 3);
         let a = model.forward(&[4, 5], &mut state)?;
         let cold = model.forward(&[1, 2, 3, 4, 5], &mut model.new_state())?;

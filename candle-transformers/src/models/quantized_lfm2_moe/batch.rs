@@ -10,7 +10,7 @@
 //! K-quants, 2..=8 MMVQ, larger MMQ), so a row's logits at B > 1 are a
 //! different measurement from the batch-1 ones, not a reproduction of them.
 use super::kv_cache::KvCache;
-use super::{attention, AttentionLayer, Model, Operator, ShortConv, State};
+use super::{attention, AttentionLayer, ConvState, Model, Operator, ShortConv, State};
 use candle::{bail, IndexOp, Module, Result, Tensor};
 
 impl AttentionLayer {
@@ -76,23 +76,44 @@ impl AttentionLayer {
     }
 }
 
+/// The `(B, hidden, k)` tensor a previous batched step wrote, when `state` is
+/// exactly its rows in order: row `i` of the batch is row `i` of the tensor.
+fn previous_batch(state: &[&mut Option<ConvState>]) -> Option<Tensor> {
+    let first = state.first()?.as_ref()?;
+    let rows = &first.rows;
+    let whole = rows.dim(0).ok()? == state.len();
+    let in_order = state.iter().enumerate().all(|(i, s)| {
+        s.as_ref()
+            .is_some_and(|s| s.row == i && s.rows.id() == rows.id())
+    });
+    (whole && in_order).then(|| rows.clone())
+}
+
 impl ShortConv {
     /// `x` `(B, 1, hidden)`; row `i` reads and replaces `state[i]`.
-    fn decode_batch(&self, x: &Tensor, state: &mut [&mut Option<Tensor>]) -> Result<Tensor> {
+    fn decode_batch(&self, x: &Tensor, state: &mut [&mut Option<ConvState>]) -> Result<Tensor> {
         let h = x.dim(2)?;
         let k = self.weight.dim(1)?;
         let projected = self.input.forward(x)?;
-        let previous = state
-            .iter()
-            .map(|s| match s.as_ref() {
-                Some(s) => Ok(s.clone()),
-                None => Tensor::zeros((1, h, k), x.dtype(), x.device()),
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let previous = Tensor::cat(&previous, 0)?;
+        let previous = match previous_batch(state) {
+            Some(rows) => rows,
+            None => {
+                let rows = state
+                    .iter()
+                    .map(|s| match s.as_ref() {
+                        Some(s) => s.row(),
+                        None => Tensor::zeros((1, h, k), x.dtype(), x.device()),
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Tensor::cat(&rows, 0)?
+            }
+        };
         let (out, next) = candle_nn::lfm2::short_conv_step(&projected, &self.weight, &previous)?;
         for (i, s) in state.iter_mut().enumerate() {
-            **s = Some(next.narrow(0, i, 1)?);
+            **s = Some(ConvState {
+                rows: next.clone(),
+                row: i,
+            });
         }
         self.output.forward(&out)
     }
@@ -259,6 +280,112 @@ mod tests {
                     .to_vec1::<f32>()?;
                 let d = max_abs(&got[i], &want);
                 assert!(d < CPU_TOL, "step {step} row {i}: {d}");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_batched_step_reads_the_previous_batch_only_for_the_same_rows_in_order() -> Result<()> {
+        let model = tiny()?;
+        let mut s: Vec<State> = [&[1u32][..], &[2, 3], &[4, 5, 6]]
+            .iter()
+            .map(|p| prefilled(&model, p))
+            .collect::<Result<_>>()?;
+        let layer = model
+            .layers
+            .iter()
+            .position(|l| matches!(l.operator, Operator::Conv(_)))
+            .unwrap();
+        let conv = |s: &mut [State]| -> Option<Tensor> {
+            let refs: Vec<&mut Option<ConvState>> =
+                s.iter_mut().map(|s| &mut s.conv[layer]).collect();
+            previous_batch(&refs)
+        };
+        // After batch-1 prefills: separate tensors, gather.
+        assert!(conv(&mut s).is_none());
+        let mut refs: Vec<&mut State> = s.iter_mut().collect();
+        model.decode_batch(&[7, 8, 9], &mut refs)?;
+        // The same rows in the same order: the step's own tensor, as is.
+        let whole = conv(&mut s).expect("same rows, same order");
+        assert_eq!(whole.dims(), &[3, 8, 3]);
+        // Any other arrangement gathers: permuted, a subset, a clone repeated.
+        s.swap(0, 1);
+        assert!(conv(&mut s).is_none());
+        s.swap(0, 1);
+        assert!(conv(&mut s[..2]).is_none());
+        let mut twice = vec![s[0].clone(), s[0].clone(), s[2].clone()];
+        assert!(conv(&mut twice).is_none());
+        // A batch-1 step on one row leaves the others' shared tensor usable,
+        // but the batch no longer matches it.
+        model.forward(&[1], &mut s[1])?;
+        assert!(conv(&mut s).is_none());
+        // Row 0 of one batch beside row 1 of another batch of the same size:
+        // right indices, different tensors. Gather, and decode each correctly.
+        let mut x: Vec<State> = [&[1u32][..], &[2, 3]]
+            .iter()
+            .map(|p| prefilled(&model, p))
+            .collect::<Result<_>>()?;
+        let mut y: Vec<State> = [&[9u32, 9, 9][..], &[4]]
+            .iter()
+            .map(|p| prefilled(&model, p))
+            .collect::<Result<_>>()?;
+        for pair in [&mut x, &mut y] {
+            let mut refs: Vec<&mut State> = pair.iter_mut().collect();
+            model.decode_batch(&[5, 6], &mut refs)?;
+        }
+        let mut mixed = vec![x[0].clone(), y[1].clone()];
+        assert!(conv(&mut mixed).is_none());
+        let want: Vec<Vec<f32>> = mixed
+            .iter()
+            .map(|st| {
+                model
+                    .forward(&[11], &mut st.clone())
+                    .and_then(|l| l.flatten_all()?.to_vec1())
+            })
+            .collect::<Result<_>>()?;
+        let mut refs: Vec<&mut State> = mixed.iter_mut().collect();
+        let got = rows(&model.decode_batch(&[11, 11], &mut refs)?)?;
+        for i in 0..2 {
+            assert!(max_abs(&got[i], &want[i]) < CPU_TOL, "mixed row {i}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn rows_rearranged_between_batched_steps_still_track_single_steps() -> Result<()> {
+        // The reuse must only ever fire for the exact arrangement: permuting,
+        // shrinking, growing and duplicating the batch between steps must give
+        // each row its own state, as batch-1 decoding would.
+        let model = tiny()?;
+        let mut batched: Vec<State> = [&[1u32, 2][..], &[3], &[4, 5, 6], &[7, 8]]
+            .iter()
+            .map(|p| prefilled(&model, p))
+            .collect::<Result<_>>()?;
+        let mut singles = batched.clone();
+        let orders: [&[usize]; 6] = [
+            &[0, 1, 2, 3],
+            &[0, 1, 2, 3],
+            &[3, 1, 0, 2],
+            &[1, 2],
+            &[0, 1, 2, 3],
+            &[2, 0],
+        ];
+        for (step, order) in orders.iter().enumerate() {
+            let tokens: Vec<u32> = order
+                .iter()
+                .map(|&i| ((step * 3 + i) % 16) as u32)
+                .collect();
+            let mut picked: Vec<State> = order.iter().map(|&i| batched[i].clone()).collect();
+            let mut refs: Vec<&mut State> = picked.iter_mut().collect();
+            let got = rows(&model.decode_batch(&tokens, &mut refs)?)?;
+            for (j, &i) in order.iter().enumerate() {
+                let want = model
+                    .forward(&[tokens[j]], &mut singles[i])?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?;
+                assert!(max_abs(&got[j], &want) < CPU_TOL, "step {step} row {i}");
+                batched[i] = picked[j].clone();
             }
         }
         Ok(())
@@ -615,7 +742,7 @@ mod rocm_real {
                     total += 2 * a.n_kv_head * a.head_dim * s.len * 4;
                 }
                 if let Some(c) = &s.conv[i] {
-                    total += c.elem_count() * 4;
+                    total += c.row()?.elem_count() * 4;
                 }
             }
         }
