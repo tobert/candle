@@ -626,47 +626,95 @@ fn prepared_routing_rejects_bad_ids_weights_and_devices_rocm() -> Result<()> {
     Ok(())
 }
 
-/// Task-major launch geometry computes every output with the same block and
-/// the same reduction as the row-major one, so the bits must match; the CPU
-/// comparisons above cover the values themselves. Shared (gate/up) and
-/// per-expert (down) inputs, a lone token and decode-sized batches.
+/// Every vector geometry computes each output with the same arithmetic as the
+/// row-major launch, so the bits must match; the CPU comparisons above cover
+/// the values themselves. Shared (gate/up) and per-pair (down) inputs; a lone
+/// token; decode-sized batches; more pairs on one expert than the expert-major
+/// kernel takes per pass (8 experts, 160 pairs); more pairs than it scans per
+/// chunk (320); a token routed to the same expert twice; experts nobody chose.
+/// Outputs are poisoned, so an unwritten element cannot pass as the previous
+/// call's result left in a reused allocation.
 #[test]
-fn indexed_moe_task_major_is_bit_identical_to_row_major_rocm() -> Result<()> {
+fn indexed_moe_geometries_are_bit_identical_to_row_major_rocm() -> Result<()> {
+    use super::Geometry::*;
     let device = rocm_device!();
+    let (experts, n, k) = (8, 96, 256);
+    let cases: [(usize, usize, usize, fn(usize) -> u32); 7] = [
+        (1, 1, 1, |i| ((i * 5 + 3) % 8) as u32),
+        (3, 2, 1, |i| ((i * 5 + 3) % 8) as u32),
+        (3, 2, 2, |i| ((i * 5 + 3) % 8) as u32),
+        (17, 4, 1, |i| ((i * 5 + 3) % 8) as u32),
+        (40, 4, 4, |i| ((i * 5 + 3) % 8) as u32),
+        (80, 4, 1, |i| ((i * 7 + i / 9) % 8) as u32),
+        // Only experts 2 and 6, and each token picks one of them twice.
+        (9, 3, 3, |i| if i % 3 == 2 { 6 } else { 2 }),
+    ];
     for dtype in MOE_DTYPES {
-        for (batch, topk, input_dim1) in [(1, 1, 1), (3, 2, 1), (3, 2, 2), (17, 4, 1), (32, 4, 4)] {
-            let (experts, n, k) = (8, 96, 256);
-            let w = Tensor::from_vec(ramp(experts * n * k, 61.), (experts, n, k), &Device::Cpu)?;
-            let qw = QTensor::quantize(&w.to_device(&device)?, dtype)?;
+        let w = Tensor::from_vec(ramp(experts * n * k, 61.), (experts, n, k), &Device::Cpu)?;
+        let qw = QTensor::quantize(&w.to_device(&device)?, dtype)?;
+        for (batch, topk, input_dim1, route) in cases {
             let x = Tensor::from_vec(
                 ramp(batch * input_dim1 * k, 43.),
                 (batch, input_dim1, k),
                 &device,
             )?;
             let ids = Tensor::from_vec(
-                (0..batch * topk)
-                    .map(|i| ((i * 5 + 3) % experts) as u32)
-                    .collect::<Vec<_>>(),
+                (0..batch * topk).map(route).collect::<Vec<_>>(),
                 (batch, topk),
                 &device,
             )?;
-            // Poisoned outputs: an unwritten element cannot pass as the stale
-            // result of the previous call in a reused allocation.
-            let row = with_work_buffer_pattern(0x7f, || {
-                super::forward_vector_for_test(&qw, &x, &ids, 0)
-            })?;
-            let row = row.flatten_all()?.to_vec1::<f32>()?;
-            // 7 does not divide n = 96: the last block runs short.
-            for rows in [1, 2, 4, 7, 8] {
-                let task = with_work_buffer_pattern(0x7f, || {
-                    super::forward_vector_for_test(&qw, &x, &ids, rows)
+            let run = |g| -> Result<Vec<f32>> {
+                let out = with_work_buffer_pattern(0x7f, || {
+                    super::forward_vector_for_test(&qw, &x, &ids, g)
                 })?;
-                assert_eq!(task.dims(), [batch, topk, n]);
-                assert_eq!(
-                    row,
-                    task.flatten_all()?.to_vec1::<f32>()?,
-                    "{dtype:?} batch={batch} topk={topk} input_dim1={input_dim1} rows={rows}"
+                assert_eq!(out.dims(), [batch, topk, n]);
+                out.flatten_all()?.to_vec1::<f32>()
+            };
+            let row = run(RowMajor)?;
+            // 7 does not divide n = 96: the last row group runs short.
+            for rows in [1, 2, 4, 7, 8] {
+                for g in [TaskMajor { rows }, ByExpert { rows }] {
+                    assert!(
+                        row == run(g)?,
+                        "{dtype:?} batch={batch} topk={topk} input_dim1={input_dim1} {g:?}"
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The expert-major kernel finds its pairs by expert id, so a pair with an
+/// out-of-range id matches no block. Its rows must come back NaN, not as
+/// whatever the allocation held, and the valid pairs must be unaffected.
+#[test]
+fn indexed_moe_by_expert_marks_out_of_range_experts_nan_rocm() -> Result<()> {
+    let device = rocm_device!();
+    let (experts, n, k, batch, topk) = (4, 64, 256, 3, 2);
+    let bad_pair = topk + 1; // token 1, slot 1
+    let w = Tensor::from_vec(ramp(experts * n * k, 61.), (experts, n, k), &Device::Cpu)?;
+    let qw = QTensor::quantize(&w.to_device(&device)?, GgmlDType::Q5K)?;
+    let x = Tensor::from_vec(ramp(batch * k, 43.), (batch, 1, k), &device)?;
+    let good = Tensor::new(&[[0u32, 1], [2, 3], [1, 0]], &device)?;
+    let bad = Tensor::new(&[[0u32, 1], [2, 4], [1, 0]], &device)?;
+    let want = super::forward_vector_for_test(&qw, &x, &good, super::Geometry::RowMajor)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    for pattern in [0, 0x7f] {
+        let got = with_work_buffer_pattern(pattern, || {
+            super::forward_vector_for_test(&qw, &x, &bad, super::Geometry::ByExpert { rows: 8 })
+        })?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+        for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+            if i / n == bad_pair {
+                assert!(
+                    g.is_nan(),
+                    "pattern {pattern}: element {i} of the bad pair is {g}"
                 );
+            } else {
+                assert_eq!(g, w, "pattern {pattern}: element {i}");
             }
         }
     }
@@ -674,7 +722,8 @@ fn indexed_moe_task_major_is_bit_identical_to_row_major_rocm() -> Result<()> {
 }
 
 #[test]
-fn task_major_geometry_starts_at_eight_tokens() {
+fn vector_geometry_policy() {
+    use super::Geometry::*;
     let mut d = super::Dims {
         num_experts: 32,
         n: 3584,
@@ -683,24 +732,31 @@ fn task_major_geometry_starts_at_eight_tokens() {
         topk: 4,
         input_dim1: 1,
     };
-    let picks: Vec<bool> = [1, 2, 4, 7, 8, 16, 32, 63]
+    let picks: Vec<super::Geometry> = [1, 2, 4, 7, 8, 16, 32, 63]
         .iter()
         .map(|&b| {
             d.batch = b;
-            super::use_task_major(&d)
+            super::geometry(&d)
         })
         .collect();
-    assert_eq!(picks, [false, false, false, false, true, true, true, true]);
-    d.batch = 8;
-    d.n = 65535 * super::TASK_MAJOR_ROWS + 1;
-    assert!(!super::use_task_major(&d));
+    let rows = super::VECTOR_ROWS;
+    let (task, expert) = (TaskMajor { rows }, ByExpert { rows });
+    assert_eq!(
+        picks,
+        [RowMajor, RowMajor, RowMajor, RowMajor, task, expert, expert, expert]
+    );
+    for batch in [8, 16] {
+        d.batch = batch;
+        d.n = 65535 * rows + 1;
+        assert_eq!(super::geometry(&d), RowMajor);
+    }
 }
 
 /// Decode-sized batches at the LFM2.5 expert shapes, row- vs task-major. Wall
 /// clock with synchronisation, activation quantization included.
 #[test]
 #[ignore = "manual timing run on ROCm GPU"]
-fn bench_task_major_moe_lfm25_rocm() -> Result<()> {
+fn bench_moe_geometries_lfm25_rocm() -> Result<()> {
     let dev = Device::new_rocm(0)?;
     for (dtype, n, k, slots) in [
         (GgmlDType::Q5K, 3584, 2048, 1),
@@ -708,7 +764,7 @@ fn bench_task_major_moe_lfm25_rocm() -> Result<()> {
     ] {
         let dense = Tensor::from_vec(ramp(32 * n * k, 61.), (32, n, k), &Device::Cpu)?;
         let weights = QTensor::quantize_onto(&dense, dtype, &dev)?;
-        for batch in [1, 2, 4, 8, 16, 32] {
+        for batch in [1, 2, 4, 8, 16, 32, 64, 128] {
             let input = Tensor::from_vec(ramp(batch * slots * k, 43.), (batch, slots, k), &dev)?;
             // Distinct experts within a token, spread across tokens.
             let ids = Tensor::from_vec(
@@ -718,16 +774,28 @@ fn bench_task_major_moe_lfm25_rocm() -> Result<()> {
                 (batch, 4),
                 &dev,
             )?;
-            // 0 = row-major; r > 0 = task-major with r rows per block. The
-            // order rotates every round so drift in a shared GPU spreads out.
-            let variants = [0usize, 1, 2, 4, 8, 16];
+            // Vector geometries, and (None) the grouped MMQ path. The order
+            // rotates every round so drift in a shared GPU spreads out.
+            use super::Geometry::*;
+            let variants = [
+                Some(RowMajor),
+                Some(TaskMajor { rows: 8 }),
+                Some(ByExpert { rows: 1 }),
+                Some(ByExpert { rows: 2 }),
+                Some(ByExpert { rows: 4 }),
+                Some(ByExpert { rows: 8 }),
+                None,
+            ];
             let mut times = vec![Vec::new(); variants.len()];
             for round in 0..21 {
                 for j in 0..variants.len() {
                     let v = (j + round) % variants.len();
                     dev.synchronize()?;
                     let start = std::time::Instant::now();
-                    let out = super::forward_vector_for_test(&weights, &input, &ids, variants[v])?;
+                    let out = match variants[v] {
+                        Some(g) => super::forward_vector_for_test(&weights, &input, &ids, g)?,
+                        None => super::forward_for_test(&weights, &input, &ids, true)?,
+                    };
                     dev.synchronize()?;
                     let elapsed = start.elapsed().as_secs_f64() * 1000.;
                     std::hint::black_box(out);
@@ -747,18 +815,17 @@ fn bench_task_major_moe_lfm25_rocm() -> Result<()> {
                 .iter()
                 .zip(&medians)
                 .map(|(v, m)| {
-                    format!(
-                        "{}={m:.4}",
-                        if *v == 0 {
-                            "row".into()
-                        } else {
-                            format!("task{v}")
-                        }
-                    )
+                    let name = match v {
+                        Some(RowMajor) => "row".to_string(),
+                        Some(TaskMajor { rows }) => format!("task{rows}"),
+                        Some(ByExpert { rows }) => format!("expert{rows}"),
+                        None => "grouped".to_string(),
+                    };
+                    format!("{name}={m:.4}")
                 })
                 .collect();
             println!(
-                "TASK_MAJOR_TIMING dtype={dtype:?} n={n} k={k} batch={batch} ms: {}",
+                "MOE_GEOMETRY_TIMING dtype={dtype:?} n={n} k={k} batch={batch} ms: {}",
                 cells.join(" ")
             );
         }

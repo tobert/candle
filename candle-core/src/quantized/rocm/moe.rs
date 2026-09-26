@@ -125,40 +125,79 @@ fn task_major_kernel_name(dtype: GgmlDType) -> Option<&'static str> {
     Some(name)
 }
 
-/// When the launcher picks task-major geometry, with [`task_major_rows`] rows
-/// per block: from 8 tokens up. Interleaved micro-bench on gfx1151 at the
-/// LFM2.5 expert shapes (Q5K 3584x2048 shared input, Q6K 2048x1792 per-pair
-/// input; medians of 20 rotating rounds, three runs), task-major with 8 rows
-/// against row-major: 8 tokens ~10% faster, 16 tokens 20-25%, 32 tokens 1.6x;
-/// 2 and 4 tokens mixed to 5-22% slower. One token was 7-15% faster in the
-/// micro-bench but ~1.5% slower per full decode step (min of three
-/// alternating process runs), so it stays row-major; full batched decode
-/// steps were ~6% faster at 8 and 16 rows and ~14% at 32. Values are
-/// identical either way. `CANDLE_ROCM_MOE_ROW_MAJOR=1` keeps the original
-/// geometry everywhere, for A/B runs.
-fn use_task_major(d: &Dims) -> bool {
-    static ROW_MAJOR: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let row_major = *ROW_MAJOR.get_or_init(|| {
-        std::env::var("CANDLE_ROCM_MOE_ROW_MAJOR").is_ok_and(|v| v != "0" && !v.is_empty())
-    });
-    // Row blocks move to grid y, whose HIP limit is 65535 blocks.
-    d.batch >= TASK_MAJOR_MIN_BATCH && d.n.div_ceil(task_major_rows()) <= 65535 && !row_major
+/// How the vector (non-grouped) path lays out its blocks. All three compute
+/// every output element with the same arithmetic; they differ in which block
+/// computes it and so in how often a weight row is read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Geometry {
+    /// One block per (output row, token, routed slot): the original launch.
+    RowMajor,
+    /// One block per (routed pair, `rows` consecutive output rows).
+    TaskMajor { rows: usize },
+    /// One block per (expert, `rows` consecutive output rows), looping over
+    /// the pairs routed to that expert.
+    ByExpert { rows: usize },
 }
 
-/// Rows per task-major block. `CANDLE_ROCM_MOE_TASK_ROWS` overrides it for
-/// tuning runs.
-fn task_major_rows() -> usize {
-    static ROWS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *ROWS.get_or_init(|| {
-        std::env::var("CANDLE_ROCM_MOE_TASK_ROWS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .filter(|&r| r > 0)
-            .unwrap_or(TASK_MAJOR_ROWS)
-    })
+/// The launcher's choice for these shapes. `CANDLE_ROCM_MOE_GEOMETRY` (`row`,
+/// `task` or `expert`) forces one for A/B runs.
+///
+/// Measured on gfx1151 at the LFM2.5-8B-A1B expert shapes (Q5K 3584x2048 with
+/// a shared input, Q6K 2048x1792 with per-pair inputs; 32 experts, top 4),
+/// 8 rows per block:
+/// - Below 8 tokens, row-major. Task-major was 5-22% slower at 2-4 tokens, and
+///   one token was ~1.5% slower per full decode step despite a faster
+///   micro-bench; expert-major was 1.5-3x slower (most blocks find no pair).
+/// - 8-15 tokens, task-major: ~10% faster per call than row-major; expert-major
+///   made a full decode step ~9% slower at 8.
+/// - From 16 tokens, expert-major. Per call against task-major: Q5K equal at
+///   16-32 and 7% faster at 64-128, Q6K 14% faster at 32-128. Full batched
+///   decode steps (min of three alternating runs): 3-4% faster at 16, ~8% at
+///   32 (101.3 -> 93.3 ms).
+/// The grouped MMQ path still takes Q5K/Q6K from 64 tokens (see `use_grouped`).
+fn geometry(d: &Dims) -> Geometry {
+    static FORCED: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    let forced = FORCED.get_or_init(|| std::env::var("CANDLE_ROCM_MOE_GEOMETRY").ok());
+    let wanted = match forced.as_deref() {
+        Some("row") => Geometry::RowMajor,
+        Some("task") => Geometry::TaskMajor { rows: VECTOR_ROWS },
+        Some("expert") => Geometry::ByExpert { rows: VECTOR_ROWS },
+        _ if d.batch >= BY_EXPERT_MIN_BATCH => Geometry::ByExpert { rows: VECTOR_ROWS },
+        _ if d.batch >= TASK_MAJOR_MIN_BATCH => Geometry::TaskMajor { rows: VECTOR_ROWS },
+        _ => Geometry::RowMajor,
+    };
+    // Row groups go on grid y, whose HIP limit is 65535 blocks.
+    match wanted {
+        Geometry::TaskMajor { rows } | Geometry::ByExpert { rows }
+            if d.n.div_ceil(rows) > 65535 =>
+        {
+            Geometry::RowMajor
+        }
+        g => g,
+    }
 }
-const TASK_MAJOR_ROWS: usize = 8;
+const BY_EXPERT_MIN_BATCH: usize = 16;
+const VECTOR_ROWS: usize = 8;
 const TASK_MAJOR_MIN_BATCH: usize = 8;
+
+/// The same kernels with expert-major launch geometry; see
+/// `indexed_moe_forward_by_expert` in `quantized.cu`.
+fn by_expert_kernel_name(dtype: GgmlDType) -> Option<&'static str> {
+    let name = match dtype {
+        GgmlDType::Q2K => "indexed_moe_forward_by_expert_q2k_q8_1",
+        GgmlDType::Q3K => "indexed_moe_forward_by_expert_q3k_q8_1",
+        GgmlDType::Q4K => "indexed_moe_forward_by_expert_q4k_q8_1",
+        GgmlDType::Q5K => "indexed_moe_forward_by_expert_q5k_q8_1",
+        GgmlDType::Q6K => "indexed_moe_forward_by_expert_q6k_q8_1",
+        GgmlDType::Q8_0 => "indexed_moe_forward_by_expert_q8_0_q8_1",
+        GgmlDType::Q4_0 => "indexed_moe_forward_by_expert_q4_0_q8_1",
+        GgmlDType::Q4_1 => "indexed_moe_forward_by_expert_q4_1_q8_1",
+        GgmlDType::Q5_0 => "indexed_moe_forward_by_expert_q5_0_q8_1",
+        GgmlDType::Q5_1 => "indexed_moe_forward_by_expert_q5_1_q8_1",
+        _ => return None,
+    };
+    Some(name)
+}
 
 /// The shapes the kernel launch is derived from, once validated.
 struct Dims {
@@ -272,8 +311,7 @@ fn forward_impl(
     ids_l: &Layout,
     grouped_override: Option<bool>,
     prepared: Option<&PackedRouting>,
-    // Some(0): row-major; Some(r): task-major with r rows per block.
-    task_major_override: Option<usize>,
+    geometry_override: Option<Geometry>,
 ) -> Result<(RocmStorage, Shape)> {
     if !q.device.same_device(&input.device) || !q.device.same_device(&ids.device) {
         crate::bail!(
@@ -373,18 +411,15 @@ fn forward_impl(
             (d.batch, d.topk, d.n).into(),
         ));
     }
-    let rows_per_block = task_major_override.unwrap_or_else(|| {
-        if use_task_major(&d) {
-            task_major_rows()
-        } else {
-            0
+    let geometry = geometry_override.unwrap_or_else(|| geometry(&d));
+    let name = match geometry {
+        Geometry::RowMajor => name,
+        Geometry::TaskMajor { .. } => {
+            task_major_kernel_name(q.dtype).expect("every indexed dtype has a task-major entry")
         }
-    });
-    let task_major = rows_per_block > 0;
-    let name = if task_major {
-        task_major_kernel_name(q.dtype).expect("every indexed dtype has a task-major entry")
-    } else {
-        name
+        Geometry::ByExpert { .. } => {
+            by_expert_kernel_name(q.dtype).expect("every indexed dtype has an expert-major entry")
+        }
     };
     let func = dev.get_or_load_func(name, &kernels::QUANTIZED)?;
 
@@ -400,7 +435,15 @@ fn forward_impl(
     let topk_i = d.topk as i32;
     let k_padded_i = k_padded as i32;
     let input_dim1_i = d.input_dim1 as i32;
-    let rows_i = rows_per_block as i32;
+    let (rows_i, experts_i) = match geometry {
+        Geometry::RowMajor => (1, d.num_experts as i32),
+        Geometry::TaskMajor { rows } | Geometry::ByExpert { rows } => {
+            if rows == 0 {
+                crate::bail!("indexed_moe_forward: rows per block must be positive")
+            }
+            (rows as i32, d.num_experts as i32)
+        }
+    };
     let mut args = vec![
         arg(&w_ptr),
         arg(&y_ptr),
@@ -418,16 +461,18 @@ fn forward_impl(
     // task id it indexes `ids` with. Task-major: `blockIdx.x` is the task id and
     // `blockIdx.y` the row, so co-scheduled blocks share weight rows.
     // Task-major blocks may compute several consecutive rows each.
-    if task_major {
-        args.push(arg(&rows_i));
-    }
-    let grid = if task_major {
-        Dim3::new_2d(
-            (d.batch * d.topk) as u32,
-            d.n.div_ceil(rows_per_block) as u32,
-        )
-    } else {
-        Dim3::new_3d(d.n as u32, d.batch as u32, d.topk as u32)
+    // Expert-major: `blockIdx.x` is the expert, `blockIdx.y` the row group.
+    let grid = match geometry {
+        Geometry::RowMajor => Dim3::new_3d(d.n as u32, d.batch as u32, d.topk as u32),
+        Geometry::TaskMajor { rows } => {
+            args.push(arg(&rows_i));
+            Dim3::new_2d((d.batch * d.topk) as u32, d.n.div_ceil(rows) as u32)
+        }
+        Geometry::ByExpert { rows } => {
+            args.push(arg(&rows_i));
+            args.push(arg(&experts_i));
+            Dim3::new_2d(d.num_experts as u32, d.n.div_ceil(rows) as u32)
+        }
     };
     func.launch(
         grid,
@@ -643,7 +688,7 @@ fn forward_vector_for_test(
     w: &crate::quantized::QTensor,
     x: &crate::Tensor,
     ids: &crate::Tensor,
-    rows_per_block: usize, // 0: row-major
+    geometry: Geometry,
 ) -> Result<crate::Tensor> {
     match (&w.storage, &*x.storage(), &*ids.storage()) {
         (
@@ -660,7 +705,7 @@ fn forward_vector_for_test(
                 ids.layout(),
                 Some(false),
                 None,
-                Some(rows_per_block),
+                Some(geometry),
             )?;
             Ok(crate::tensor::from_storage(
                 crate::Storage::Rocm(out),

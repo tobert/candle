@@ -5071,3 +5071,181 @@ INDEXED_MOE_TASK_MAJOR(indexed_moe_forward_task_major_q4_1_q8_1, QK4_1, QI4_1, b
 INDEXED_MOE_TASK_MAJOR(indexed_moe_forward_task_major_q5_0_q8_1, QK5_0, QI5_0, block_q5_0, VDR_Q5_0_Q8_1_MMVQ, vec_dot_q5_0_q8_1)
 INDEXED_MOE_TASK_MAJOR(indexed_moe_forward_task_major_q5_1_q8_1, QK5_1, QI5_1, block_q5_1, VDR_Q5_1_Q8_1_MMVQ, vec_dot_q5_1_q8_1)
 #undef INDEXED_MOE_TASK_MAJOR
+
+// Expert-major indexed MoE matvec: one block per (expert, group of
+// `rows_per_block` output rows). The block finds the routed pairs that chose
+// its expert by scanning `indices` itself (no host-side counts or packing),
+// then computes its rows for up to MOE_BY_EXPERT_COLS of those pairs at a
+// time, so each weight row is read once for all of them instead of once per
+// pair. Every output element is computed exactly as `indexed_moe_forward`
+// computes it: the same thread-to-block mapping, the same per-thread
+// accumulation order and the same cross-warp and warp reductions, so the
+// values are identical. Which pair lands in which column slot (it follows a
+// shared-memory atomic) does not touch any output's arithmetic.
+//
+// A pair whose expert id is out of range matches no block; the expert-0
+// blocks write NaN to its rows instead of leaving them unwritten.
+#define MOE_BY_EXPERT_COLS 8
+#define MOE_BY_EXPERT_CHUNK 256
+
+// `NC` routed pairs (all of them real) against rows [row_begin, row_end) of
+// one expert's weights.
+template <int NC, int qk, int qi, typename block_q_t, int vdr, vec_dot_q_cuda_t vec_dot_q_cuda>
+__device__ __forceinline__ void moe_by_expert_columns(
+    const block_q_t * __restrict__ w,
+    const void * __restrict__ all_inputs,
+    const int * tasks,
+    float * __restrict__ all_outputs,
+    float (*tmp_shared)[3][WARP_SIZE],
+    const int n, const int k, const int topk, const int k_padded, const int input_dim1,
+    const int row_begin, const int row_end) {
+    constexpr int nwarps = 4;
+    const int tid = WARP_SIZE * threadIdx.y + threadIdx.x;
+    const int blocks_per_row_x = k / qk;
+    constexpr int blocks_per_iter = vdr * nwarps * WARP_SIZE / qi;
+    const size_t input_task_stride_bytes = (size_t)k_padded / QK8_1 * sizeof(block_q8_1);
+    const block_q8_1 * xs[NC];
+#pragma unroll
+    for (int j = 0; j < NC; ++j) {
+        const int t = tasks[j];
+        const int input_idx = (input_dim1 == 1) ? t / topk : t;
+        xs[j] = (const block_q8_1 *)((const char *)all_inputs + input_idx * input_task_stride_bytes);
+    }
+    for (int row0 = row_begin; row0 < row_end; ++row0) {
+        float tmp[NC];
+#pragma unroll
+        for (int j = 0; j < NC; ++j) {
+            tmp[j] = 0.0f;
+        }
+        for (int kbx = tid / (qi / vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+            const int kby = kbx * (qk / QK8_1);
+            const int kqs = vdr * (tid % (qi / vdr));
+#pragma unroll
+            for (int j = 0; j < NC; ++j) {
+                tmp[j] += vec_dot_q_cuda(&w[kbx + row0 * blocks_per_row_x], &xs[j][kby], kqs);
+            }
+        }
+        if (threadIdx.y > 0) {
+#pragma unroll
+            for (int j = 0; j < NC; ++j) {
+                tmp_shared[j][threadIdx.y - 1][threadIdx.x] = tmp[j];
+            }
+        }
+        __syncthreads();
+        if (threadIdx.y == 0) {
+#pragma unroll
+            for (int j = 0; j < NC; ++j) {
+                float v = tmp[j];
+                for (int l = 0; l < nwarps - 1; ++l) {
+                    v += tmp_shared[j][l][threadIdx.x];
+                }
+                v = warp_reduce_sum(v);
+                if (threadIdx.x == 0) {
+                    all_outputs[(size_t)tasks[j] * n + row0] = v;
+                }
+            }
+        }
+        __syncthreads();
+    }
+}
+
+// Expert-major indexed MoE matvec: one block per (expert, group of
+// `rows_per_block` output rows). The block finds the routed pairs that chose
+// its expert by scanning `indices` itself (no host-side counts or packing),
+// then computes its rows for up to MOE_BY_EXPERT_COLS of those pairs at a
+// time, so each weight row is read once for all of them instead of once per
+// pair. Every output element is computed exactly as `indexed_moe_forward`
+// computes it: the same thread-to-block mapping, the same per-thread
+// accumulation order and the same cross-warp and warp reductions, so the
+// values are identical. Which pair lands in which column slot (it follows a
+// shared-memory atomic) does not touch any output's arithmetic.
+//
+// A pair whose expert id is out of range matches no block; the expert-0
+// blocks write NaN to its rows instead of leaving them unwritten.
+template <int qk, int qi, typename block_q_t, int vdr, vec_dot_q_cuda_t vec_dot_q_cuda>
+__device__ void indexed_moe_forward_by_expert(
+    const void * __restrict__ all_weights,
+    const void * __restrict__ all_inputs,
+    const unsigned int * __restrict__ indices,
+    float * __restrict__ all_outputs,
+    const int n,
+    const int k,
+    const int batch,
+    const int topk,
+    const int k_padded,
+    const int input_dim1,
+    const int rows_per_block,
+    const int num_experts) {
+
+    constexpr int nwarps = 4;
+    const int expert = blockIdx.x;
+    const int row_begin = blockIdx.y * rows_per_block;
+    const int row_end = min(row_begin + rows_per_block, n);
+    const int total = batch * topk;
+    const int tid = WARP_SIZE * threadIdx.y + threadIdx.x;
+
+    const size_t weight_expert_stride_bytes = (size_t)(n * k) / qk * sizeof(block_q_t);
+    const block_q_t * w = (const block_q_t *)((const char *)all_weights + expert * weight_expert_stride_bytes);
+
+    __shared__ int tasks[MOE_BY_EXPERT_CHUNK];
+    __shared__ int ntasks;
+    __shared__ float tmp_shared[MOE_BY_EXPERT_COLS][nwarps - 1][WARP_SIZE];
+
+    for (int base = 0; base < total; base += MOE_BY_EXPERT_CHUNK) {
+        if (tid == 0) {
+            ntasks = 0;
+        }
+        __syncthreads();
+        for (int t = base + tid; t < base + MOE_BY_EXPERT_CHUNK && t < total; t += nwarps * WARP_SIZE) {
+            const unsigned int e = indices[t];
+            if (e == (unsigned int)expert) {
+                tasks[atomicAdd(&ntasks, 1)] = t;
+            } else if (expert == 0 && e >= (unsigned int)num_experts) {
+                for (int r = row_begin; r < row_end; ++r) {
+                    all_outputs[(size_t)t * n + r] = __int_as_float(0x7fc00000);
+                }
+            }
+        }
+        __syncthreads();
+        const int count = ntasks;
+        // Everyone has read the count before the next chunk resets it.
+        __syncthreads();
+
+        // Column groups of 8, then 4, 2 and 1: each pass reduces only real
+        // columns. `count` is uniform across the block, so are the branches.
+        int c = 0;
+#define MOE_BY_EXPERT_PASS(NC)                                                                    \
+        for (; count - c >= NC; c += NC) {                                                        \
+            moe_by_expert_columns<NC, qk, qi, block_q_t, vdr, vec_dot_q_cuda>(                    \
+                w, all_inputs, tasks + c, all_outputs, tmp_shared, n, k, topk, k_padded,          \
+                input_dim1, row_begin, row_end);                                                  \
+        }
+        MOE_BY_EXPERT_PASS(8)
+        MOE_BY_EXPERT_PASS(4)
+        MOE_BY_EXPERT_PASS(2)
+        MOE_BY_EXPERT_PASS(1)
+#undef MOE_BY_EXPERT_PASS
+    }
+}
+
+#define INDEXED_MOE_BY_EXPERT(name, qk, qi, block_t, vdr, dot)                           \
+extern "C" __global__ void name(                                                         \
+    const void * __restrict__ all_weights, const void * __restrict__ all_inputs,         \
+    const unsigned int * __restrict__ indices, float * __restrict__ all_outputs,         \
+    const int n, const int k, const int batch, const int topk, const int k_padded,       \
+    const int input_dim1, const int rows_per_block, const int num_experts) {             \
+    indexed_moe_forward_by_expert<qk, qi, block_t, vdr, dot>                             \
+        (all_weights, all_inputs, indices, all_outputs, n, k, batch, topk, k_padded,     \
+         input_dim1, rows_per_block, num_experts);                                       \
+}
+INDEXED_MOE_BY_EXPERT(indexed_moe_forward_by_expert_q2k_q8_1, QK_K, QI2_K, block_q2_K, VDR_Q2_K_Q8_1_MMVQ, vec_dot_q2_K_q8_1)
+INDEXED_MOE_BY_EXPERT(indexed_moe_forward_by_expert_q3k_q8_1, QK_K, QI3_K, block_q3_K, VDR_Q3_K_Q8_1_MMVQ, vec_dot_q3_K_q8_1)
+INDEXED_MOE_BY_EXPERT(indexed_moe_forward_by_expert_q4k_q8_1, QK_K, QI4_K, block_q4_K, VDR_Q4_K_Q8_1_MMVQ, vec_dot_q4_K_q8_1)
+INDEXED_MOE_BY_EXPERT(indexed_moe_forward_by_expert_q5k_q8_1, QK_K, QI5_K, block_q5_K, VDR_Q5_K_Q8_1_MMVQ, vec_dot_q5_K_q8_1)
+INDEXED_MOE_BY_EXPERT(indexed_moe_forward_by_expert_q6k_q8_1, QK_K, QI6_K, block_q6_K, VDR_Q6_K_Q8_1_MMVQ, vec_dot_q6_K_q8_1)
+INDEXED_MOE_BY_EXPERT(indexed_moe_forward_by_expert_q8_0_q8_1, QK8_0, QI8_0, block_q8_0, VDR_Q8_0_Q8_1_MMVQ, vec_dot_q8_0_q8_1)
+INDEXED_MOE_BY_EXPERT(indexed_moe_forward_by_expert_q4_0_q8_1, QK4_0, QI4_0, block_q4_0, VDR_Q4_0_Q8_1_MMVQ, vec_dot_q4_0_q8_1)
+INDEXED_MOE_BY_EXPERT(indexed_moe_forward_by_expert_q4_1_q8_1, QK4_1, QI4_1, block_q4_1, VDR_Q4_1_Q8_1_MMVQ, vec_dot_q4_1_q8_1)
+INDEXED_MOE_BY_EXPERT(indexed_moe_forward_by_expert_q5_0_q8_1, QK5_0, QI5_0, block_q5_0, VDR_Q5_0_Q8_1_MMVQ, vec_dot_q5_0_q8_1)
+INDEXED_MOE_BY_EXPERT(indexed_moe_forward_by_expert_q5_1_q8_1, QK5_1, QI5_1, block_q5_1, VDR_Q5_1_Q8_1_MMVQ, vec_dot_q5_1_q8_1)
+#undef INDEXED_MOE_BY_EXPERT
