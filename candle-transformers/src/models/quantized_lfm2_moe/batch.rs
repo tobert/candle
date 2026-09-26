@@ -533,6 +533,15 @@ mod rocm_real {
         dtop1_nats_max: f64,
         dtop20_nats_median: f64,
         dtop20_nats_max: f64,
+        /// Largest |delta logprob| over tokens the batch-1 read gives >= 1%.
+        dp1pct_nats_max: f64,
+        /// KL(batch-1 || batched) in nats, per row and step.
+        kl_median: f64,
+        kl_max: f64,
+        /// The first step only: one forward's kernel difference, before the
+        /// rows' own KV (written by the batched kernels) compounds it.
+        step0_dtop1_nats_max: f64,
+        step0_kl_max: f64,
     }
     #[derive(serde::Serialize)]
     struct Timing {
@@ -570,6 +579,194 @@ mod rocm_real {
             }
         }
         Ok(total)
+    }
+
+    /// decode_batch with a device synchronisation after each part, charging
+    /// the wall time to a category. It must give decode_batch's own logits
+    /// (checked by the caller), so the mirror cannot drift from the model.
+    fn profiled_step(
+        model: &Model,
+        tokens: &[u32],
+        states: &mut [State],
+        acc: &mut std::collections::BTreeMap<&'static str, f64>,
+    ) -> Result<Tensor> {
+        let dev = model.device.clone();
+        let mut t = Instant::now();
+        let mut lap = |acc: &mut std::collections::BTreeMap<&'static str, f64>,
+                       k: &'static str|
+         -> Result<()> {
+            dev.synchronize()?;
+            *acc.entry(k).or_default() += t.elapsed().as_secs_f64() * 1e3;
+            t = Instant::now();
+            Ok(())
+        };
+        let b = tokens.len();
+        let pos: Vec<usize> = states.iter().map(|s| s.len).collect();
+        let positions = Tensor::from_iter(pos.iter().map(|&p| p as u32), &model.device)?;
+        let ids = Tensor::from_slice(tokens, (b, 1), &model.device)?;
+        let mut x = model.embedding.embedding(&ids)?;
+        lap(acc, "embed")?;
+        for (i, layer) in model.layers.iter().enumerate() {
+            let normed = layer.norm.forward(&x)?;
+            lap(acc, "norms+residual")?;
+            let y = match &layer.operator {
+                Operator::Attention(a) => {
+                    let (q, k, v) = a.qkv.forward(&normed)?;
+                    let q = q.reshape((b, 1, a.n_head, a.head_dim))?.transpose(1, 2)?;
+                    let k = k
+                        .reshape((b, 1, a.n_kv_head, a.head_dim))?
+                        .transpose(1, 2)?;
+                    let v = v
+                        .reshape((b, 1, a.n_kv_head, a.head_dim))?
+                        .transpose(1, 2)?
+                        .contiguous()?;
+                    let q = a.q_norm.forward(&q.contiguous()?)?;
+                    let k = a.k_norm.forward(&k.contiguous()?)?;
+                    let half = a.head_dim / 2;
+                    let cos = a.cos.index_select(&positions, 0)?.reshape((b, 1, half))?;
+                    let sin = a.sin.index_select(&positions, 0)?.reshape((b, 1, half))?;
+                    let q = candle_nn::rotary_emb::rope(&q.contiguous()?, &cos, &sin)?;
+                    let k = candle_nn::rotary_emb::rope(&k.contiguous()?, &cos, &sin)?;
+                    lap(acc, "attn qkv+norm+rope (batched)")?;
+                    let mut ys = Vec::with_capacity(b);
+                    for (r, s) in states.iter_mut().enumerate() {
+                        let next = KvCache::append(
+                            s.kv[i].as_ref(),
+                            &k.narrow(0, r, 1)?,
+                            &v.narrow(0, r, 1)?,
+                            a.cos.dim(0)?,
+                        )?;
+                        let (ki, vi) = next.current()?;
+                        s.kv[i] = Some(next);
+                        ys.push(attention::forward(
+                            &q.narrow(0, r, 1)?,
+                            &ki,
+                            &vi,
+                            None,
+                            &a.neg_inf,
+                        )?);
+                    }
+                    let y = Tensor::cat(&ys, 0)?
+                        .transpose(1, 2)?
+                        .reshape((b, 1, model.hidden))?;
+                    lap(acc, "attn kv append+attention (per row)")?;
+                    let y = a.wo.forward(&y)?;
+                    lap(acc, "attn output proj (batched)")?;
+                    y
+                }
+                Operator::Conv(c) => {
+                    let mut conv: Vec<_> = states.iter_mut().map(|s| &mut s.conv[i]).collect();
+                    let y = c.decode_batch(&normed, &mut conv)?;
+                    lap(acc, "conv (batched)")?;
+                    y
+                }
+            };
+            x = (x + y)?;
+            let f = layer.ffn_norm.forward(&x)?;
+            lap(acc, "norms+residual")?;
+            let f = layer.ffn.forward(&f, None, None)?;
+            lap(
+                acc,
+                match layer.ffn {
+                    super::super::FeedForward::Dense(_) => "dense ffn",
+                    _ => "moe (router+experts)",
+                },
+            )?;
+            x = (&x + f)?;
+        }
+        let x = model.norm.forward(&x)?.i((.., 0, ..))?.contiguous()?;
+        let logits = model.output.forward(&x)?;
+        lap(acc, "head")?;
+        for s in states.iter_mut() {
+            s.len += 1;
+        }
+        Ok(logits)
+    }
+
+    /// Prefill throughput of ONE sequence by chunk size, from a 512-token
+    /// context: what a ragged multi-sequence prefill could gain is what larger
+    /// chunks gain here, since the weight-bound work sees only the token count.
+    #[test]
+    #[ignore = "bench: requires ROCm, LFM25_GGUF, LFM25_PROMPTS"]
+    fn rocm_prefill_chunk_sweep() -> Result<()> {
+        let device = Device::new_rocm(0)?;
+        let model = load(&device)?;
+        let spec: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(env("LFM25_PROMPTS"))?).unwrap();
+        let prompts: Vec<Vec<u32>> = serde_json::from_value(spec["prompts"].clone()).unwrap();
+        let p = prompts
+            .iter()
+            .find(|p| p.len() >= 3072)
+            .expect("a 3072-token prompt");
+        let base = prefill(&model, p, &[512])?.remove(0);
+        for chunk in [1usize, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048] {
+            let mut ms = Vec::new();
+            for round in 0..6 {
+                memory_guard()?;
+                let mut s = base.clone();
+                let t = Instant::now();
+                let l = model.forward(&p[512..512 + chunk], &mut s)?;
+                let _ = l.argmax(D::Minus1)?.to_vec1::<u32>()?;
+                if round > 0 {
+                    ms.push(t.elapsed().as_secs_f64() * 1e3);
+                }
+            }
+            let m = pct(&mut ms, 0.5);
+            eprintln!(
+                "PREFILL_SWEEP chunk={chunk} ms={m:.2} tok_per_s={:.0}",
+                chunk as f64 * 1e3 / m
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "profile: requires ROCm, LFM25_GGUF, LFM25_PROMPTS"]
+    fn rocm_decode_batch_profile() -> Result<()> {
+        let device = Device::new_rocm(0)?;
+        let model = load(&device)?;
+        let spec: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(env("LFM25_PROMPTS"))?).unwrap();
+        let prompts: Vec<Vec<u32>> = serde_json::from_value(spec["prompts"].clone()).unwrap();
+        let ctx: usize = std::env::var("LFM25_PROFILE_CTX").map_or(512, |v| v.parse().unwrap());
+        let pool: Vec<State> = prompts
+            .iter()
+            .filter(|p| p.len() > ctx)
+            .map(|p| prefill(&model, p, &[ctx]).map(|mut v| v.remove(0)))
+            .collect::<Result<_>>()?;
+        for b in [1usize, 8, 32] {
+            let mut rows: Vec<State> = (0..b).map(|i| pool[i % pool.len()].clone()).collect();
+            let tokens: Vec<u32> = (0..b as u32).map(|i| 1000 + i).collect();
+            // Warm and fork every row off the shared pool storage first.
+            let mut warm: Vec<&mut State> = rows.iter_mut().collect();
+            model.decode_batch(&tokens, &mut warm)?;
+            let mut acc = std::collections::BTreeMap::new();
+            let steps = 10;
+            for _ in 0..steps {
+                // The profiled rows append in place; the untimed twin forks.
+                let mut twin = rows.clone();
+                let got = host_rows(&profiled_step(&model, &tokens, &mut rows, &mut acc)?)?;
+                let mut refs: Vec<&mut State> = twin.iter_mut().collect();
+                let want = host_rows(&model.decode_batch(&tokens, &mut refs)?)?;
+                assert!(
+                    got == want,
+                    "profiled mirror diverged from decode_batch at B={b}"
+                );
+            }
+            let total: f64 = acc.values().sum();
+            eprintln!(
+                "PROFILE B={b} ctx={ctx}: {:.2} ms/step (synchronised)",
+                total / steps as f64
+            );
+            for (k, v) in &acc {
+                eprintln!(
+                    "PROFILE   {k:<38} {:>8.3} ms  {:>5.1}%",
+                    v / steps as f64,
+                    100. * v / total
+                );
+            }
+        }
+        Ok(())
     }
 
     #[test]
@@ -619,17 +816,22 @@ mod rocm_real {
         );
 
         // Drift: batched vs batch-1, teacher-forced on the batch-1 greedy token.
+        // LFM25_BENCH_PHASES picks among drift and timing (default both);
+        // LFM25_BENCH_SERIAL=0 skips the serial baseline.
+        let phases = std::env::var("LFM25_BENCH_PHASES").unwrap_or("drift,timing".into());
+        let serial_on = std::env::var("LFM25_BENCH_SERIAL").map_or(true, |v| v != "0");
         let mixed = &regimes[3].1;
         let mut drift = Vec::new();
         let steps = 8;
-        for &b in &bs {
+        for &b in bs.iter().filter(|_| phases.contains("drift")) {
             let mut batched: Vec<State> = mixed[..b].to_vec();
             let mut single: Vec<State> = mixed[..b].to_vec();
             // The snapshots stop one token short: the first step feeds each
             // prompt's real last token, later steps the batch-1 greedy token.
             let mut tokens: Vec<u32> = (0..b).map(|i| *prompts[i].last().unwrap()).collect();
             let (mut d1, mut d20, mut agree) = (Vec::new(), Vec::new(), 0);
-            for _ in 0..steps {
+            let (mut dp, mut kl, mut s0d1, mut s0kl) = (Vec::new(), Vec::new(), 0f64, 0f64);
+            for step in 0..steps {
                 memory_guard()?;
                 let mut refs: Vec<&mut State> = batched.iter_mut().collect();
                 let got = host_rows(&model.decode_batch(&tokens, &mut refs)?)?;
@@ -647,6 +849,21 @@ mod rocm_real {
                             .map(|&j| (lg[j] - lw[j]).abs())
                             .fold(0., f64::max),
                     );
+                    let mut k = 0.;
+                    let mut pmax = 0f64;
+                    for (w, g) in lw.iter().zip(&lg) {
+                        let p = w.exp();
+                        k += p * (w - g);
+                        if p >= 0.01 {
+                            pmax = pmax.max((w - g).abs());
+                        }
+                    }
+                    dp.push(pmax);
+                    kl.push(k);
+                    if step == 0 {
+                        s0d1 = s0d1.max(*d1.last().unwrap());
+                        s0kl = s0kl.max(k);
+                    }
                     tokens[i] = top;
                 }
             }
@@ -659,9 +876,17 @@ mod rocm_real {
                 dtop1_nats_max: pct(&mut d1, 1.0),
                 dtop20_nats_median: pct(&mut d20, 0.5),
                 dtop20_nats_max: pct(&mut d20, 1.0),
+                dp1pct_nats_max: pct(&mut dp, 1.0),
+                kl_median: pct(&mut kl, 0.5),
+                kl_max: pct(&mut kl, 1.0),
+                step0_dtop1_nats_max: s0d1,
+                step0_kl_max: s0kl,
             };
-            eprintln!("drift B={b}: top1 {}/{n}, top1 |d| med {:.4} max {:.4}, top20 max|d| med {:.4} max {:.4}",
-                agree, row.dtop1_nats_median, row.dtop1_nats_max, row.dtop20_nats_median, row.dtop20_nats_max);
+            eprintln!(
+                "drift B={b}: top1 {agree}/{n}, top1 |d| med {:.4} max {:.4}, top20 max|d| med {:.4} max {:.4}, p>=1% max|d| {:.4}, KL med {:.2e} max {:.2e}, step0 top1 max {:.4} KL max {:.2e}",
+                row.dtop1_nats_median, row.dtop1_nats_max, row.dtop20_nats_median, row.dtop20_nats_max,
+                row.dp1pct_nats_max, row.kl_median, row.kl_max, row.step0_dtop1_nats_max, row.step0_kl_max
+            );
             drift.push(row);
         }
 
@@ -669,7 +894,7 @@ mod rocm_real {
         // each row's greedy token, which a real decode loop needs anyway.
         let (warm, timed) = (3, 24);
         let mut timing = Vec::new();
-        for (name, pool) in &regimes {
+        for (name, pool) in regimes.iter().filter(|_| phases.contains("timing")) {
             for &b in &bs {
                 memory_guard()?;
                 let rows: Vec<State> = (0..b).map(|i| pool[i % pool.len()].clone()).collect();
@@ -693,7 +918,7 @@ mod rocm_real {
                 let mut serial = rows.clone();
                 let mut stoks = vec![1u32; b];
                 let mut sms = Vec::new();
-                for step in 0..warm + timed / 2 {
+                for step in 0..(warm + timed / 2) * usize::from(serial_on) {
                     let t = Instant::now();
                     for (i, s) in serial.iter_mut().enumerate() {
                         let l = model.forward(&[stoks[i]], s)?;
@@ -704,7 +929,11 @@ mod rocm_real {
                     }
                 }
                 let p50 = pct(&mut ms, 0.5);
-                let sp50 = pct(&mut sms, 0.5);
+                let sp50 = if sms.is_empty() {
+                    f64::NAN
+                } else {
+                    pct(&mut sms, 0.5)
+                };
                 let row = Timing {
                     regime: name.clone(),
                     b,
@@ -725,6 +954,9 @@ mod rocm_real {
         }
         let record = serde_json::json!({
             "prompts_sha256": spec["sha256"],
+            "phases": phases,
+            "moe_row_major_forced": std::env::var("CANDLE_ROCM_MOE_ROW_MAJOR").ok(),
+            "force_dmmv": std::env::var("CANDLE_ROCM_FORCE_DMMV").ok(),
             "prompt_lengths": prompts.iter().map(Vec::len).collect::<Vec<_>>(),
             "prefill_seconds": prefill_s,
             "device_used_mib_before_load": used0,
