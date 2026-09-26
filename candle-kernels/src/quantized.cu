@@ -4781,7 +4781,15 @@ extern "C" __global__ void MMQ_LAUNCH_BOUNDS(Q6_K) grouped_mul_mat_q6_K(
  * @param input_task_stride_bytes The stride in bytes to get from one quantized input vector to the next.
  * @param output_task_stride_elems The stride in elements (f32) to get from one output vector to the next.
  */
-template <int qk, int qi, typename block_q_t, int vdr, vec_dot_q_cuda_t vec_dot_q_cuda>
+//
+// `task_major` changes only which block computes what: with it, `blockIdx.x`
+// is the task and `blockIdx.y` the output row, so the blocks the hardware
+// schedules together share a weight row across every routed task instead of
+// walking one task's rows. Tasks routed to the same expert then read that row
+// once from DRAM rather than once each. Every output element is still one
+// block's reduction in the same order, so the values are identical.
+template <int qk, int qi, typename block_q_t, int vdr, vec_dot_q_cuda_t vec_dot_q_cuda,
+          bool task_major = false>
 __device__ void indexed_moe_forward(
     const void * __restrict__ all_weights,
     const void * __restrict__ all_inputs,
@@ -4794,16 +4802,27 @@ __device__ void indexed_moe_forward(
     const int k_padded,
     const int input_dim1) {
 
-    // `blockIdx.y` corresponds to the batch index (0 to batch_size-1)
-    const int current_batch = blockIdx.y;
-    // `blockIdx.z` corresponds to the topk index (0 to topk-1)
-    const int current_topk = blockIdx.z;
+    int current_batch, task_id, row_block;
+    if (task_major) {
+        task_id = blockIdx.x;
+        if (task_id >= batch * topk) {
+            return;
+        }
+        current_batch = task_id / topk;
+        row_block = blockIdx.y;
+    } else {
+        // `blockIdx.y` corresponds to the batch index (0 to batch_size-1)
+        current_batch = blockIdx.y;
+        // `blockIdx.z` corresponds to the topk index (0 to topk-1)
+        const int current_topk = blockIdx.z;
 
-    // `gridDim.z` is the number of blocks in the z-dim, which is `topk`.
-    // This correctly flattens the (batch, topk) index into a single task ID.
-    const int task_id = current_batch * gridDim.z + current_topk;
-    if (task_id >= gridDim.y * gridDim.z) {
-        return;
+        // `gridDim.z` is the number of blocks in the z-dim, which is `topk`.
+        // This correctly flattens the (batch, topk) index into a single task ID.
+        task_id = current_batch * gridDim.z + current_topk;
+        if (task_id >= gridDim.y * gridDim.z) {
+            return;
+        }
+        row_block = blockIdx.x;
     }
     // If input_dim1 is 1, all experts in a batch use the same input vector.
     // Otherwise, each expert has a unique input vector.
@@ -4834,7 +4853,7 @@ __device__ void indexed_moe_forward(
     constexpr int rows_per_cuda_block = 1;
 
     const int tid = WARP_SIZE * threadIdx.y + threadIdx.x;
-    const int row0 = rows_per_cuda_block * blockIdx.x; // `blockIdx.x` is the row within the task
+    const int row0 = rows_per_cuda_block * row_block; // the row within the task
 
     if (row0 >= n) {
         return;
@@ -5022,3 +5041,26 @@ extern "C" __global__ void indexed_moe_forward_q5_1_q8_1(
     indexed_moe_forward<QK5_1, QI5_1, block_q5_1, VDR_Q5_1_Q8_1_MMVQ, vec_dot_q5_1_q8_1>
         (all_weights, all_inputs, indices, all_outputs, n, k, batch, topk, k_padded, input_dim1);
 }
+
+// Task-major launch geometry for the same computation; see `indexed_moe_forward`.
+// Grid: (batch * topk, n). The launcher opts into these.
+#define INDEXED_MOE_TASK_MAJOR(name, qk, qi, block_t, vdr, dot)                         \
+extern "C" __global__ void name(                                                         \
+    const void * __restrict__ all_weights, const void * __restrict__ all_inputs,         \
+    const unsigned int * __restrict__ indices, float * __restrict__ all_outputs,         \
+    const int n, const int k, const int batch, const int topk, const int k_padded,       \
+    const int input_dim1) {                                                              \
+    indexed_moe_forward<qk, qi, block_t, vdr, dot, true>                                 \
+        (all_weights, all_inputs, indices, all_outputs, n, k, batch, topk, k_padded, input_dim1); \
+}
+INDEXED_MOE_TASK_MAJOR(indexed_moe_forward_task_major_q2k_q8_1, QK_K, QI2_K, block_q2_K, VDR_Q2_K_Q8_1_MMVQ, vec_dot_q2_K_q8_1)
+INDEXED_MOE_TASK_MAJOR(indexed_moe_forward_task_major_q3k_q8_1, QK_K, QI3_K, block_q3_K, VDR_Q3_K_Q8_1_MMVQ, vec_dot_q3_K_q8_1)
+INDEXED_MOE_TASK_MAJOR(indexed_moe_forward_task_major_q4k_q8_1, QK_K, QI4_K, block_q4_K, VDR_Q4_K_Q8_1_MMVQ, vec_dot_q4_K_q8_1)
+INDEXED_MOE_TASK_MAJOR(indexed_moe_forward_task_major_q5k_q8_1, QK_K, QI5_K, block_q5_K, VDR_Q5_K_Q8_1_MMVQ, vec_dot_q5_K_q8_1)
+INDEXED_MOE_TASK_MAJOR(indexed_moe_forward_task_major_q6k_q8_1, QK_K, QI6_K, block_q6_K, VDR_Q6_K_Q8_1_MMVQ, vec_dot_q6_K_q8_1)
+INDEXED_MOE_TASK_MAJOR(indexed_moe_forward_task_major_q8_0_q8_1, QK8_0, QI8_0, block_q8_0, VDR_Q8_0_Q8_1_MMVQ, vec_dot_q8_0_q8_1)
+INDEXED_MOE_TASK_MAJOR(indexed_moe_forward_task_major_q4_0_q8_1, QK4_0, QI4_0, block_q4_0, VDR_Q4_0_Q8_1_MMVQ, vec_dot_q4_0_q8_1)
+INDEXED_MOE_TASK_MAJOR(indexed_moe_forward_task_major_q4_1_q8_1, QK4_1, QI4_1, block_q4_1, VDR_Q4_1_Q8_1_MMVQ, vec_dot_q4_1_q8_1)
+INDEXED_MOE_TASK_MAJOR(indexed_moe_forward_task_major_q5_0_q8_1, QK5_0, QI5_0, block_q5_0, VDR_Q5_0_Q8_1_MMVQ, vec_dot_q5_0_q8_1)
+INDEXED_MOE_TASK_MAJOR(indexed_moe_forward_task_major_q5_1_q8_1, QK5_1, QI5_1, block_q5_1, VDR_Q5_1_Q8_1_MMVQ, vec_dot_q5_1_q8_1)
+#undef INDEXED_MOE_TASK_MAJOR

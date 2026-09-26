@@ -106,6 +106,40 @@ fn kernel_name(dtype: GgmlDType) -> Option<&'static str> {
     Some(name)
 }
 
+/// The same kernels with task-major launch geometry; see `indexed_moe_forward`
+/// in `quantized.cu`. Identical values, different DRAM traffic.
+fn task_major_kernel_name(dtype: GgmlDType) -> Option<&'static str> {
+    let name = match dtype {
+        GgmlDType::Q2K => "indexed_moe_forward_task_major_q2k_q8_1",
+        GgmlDType::Q3K => "indexed_moe_forward_task_major_q3k_q8_1",
+        GgmlDType::Q4K => "indexed_moe_forward_task_major_q4k_q8_1",
+        GgmlDType::Q5K => "indexed_moe_forward_task_major_q5k_q8_1",
+        GgmlDType::Q6K => "indexed_moe_forward_task_major_q6k_q8_1",
+        GgmlDType::Q8_0 => "indexed_moe_forward_task_major_q8_0_q8_1",
+        GgmlDType::Q4_0 => "indexed_moe_forward_task_major_q4_0_q8_1",
+        GgmlDType::Q4_1 => "indexed_moe_forward_task_major_q4_1_q8_1",
+        GgmlDType::Q5_0 => "indexed_moe_forward_task_major_q5_0_q8_1",
+        GgmlDType::Q5_1 => "indexed_moe_forward_task_major_q5_1_q8_1",
+        _ => return None,
+    };
+    Some(name)
+}
+
+/// Task-major geometry from 16 tokens up (batched decode), where tokens'
+/// routed pairs sharing expert rows through the cache pays: measured on
+/// gfx1151 at the LFM2.5 shapes, 1.15x at 16 and 1.26-1.30x at 32, but a
+/// 4-17% loss at 2-4 tokens, where there is little to share.
+/// `CANDLE_ROCM_MOE_ROW_MAJOR=1` keeps the original geometry, for A/B runs.
+const TASK_MAJOR_MIN_BATCH: usize = 16;
+
+fn use_task_major(d: &Dims) -> bool {
+    static ROW_MAJOR: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let row_major = *ROW_MAJOR.get_or_init(|| {
+        std::env::var("CANDLE_ROCM_MOE_ROW_MAJOR").is_ok_and(|v| v != "0" && !v.is_empty())
+    });
+    d.batch >= TASK_MAJOR_MIN_BATCH && !row_major
+}
+
 /// The shapes the kernel launch is derived from, once validated.
 struct Dims {
     num_experts: usize,
@@ -159,7 +193,7 @@ pub(super) fn forward(
     ids: &RocmStorage,
     ids_l: &Layout,
 ) -> Result<(RocmStorage, Shape)> {
-    forward_impl(q, self_shape, input, input_l, ids, ids_l, None, None)
+    forward_impl(q, self_shape, input, input_l, ids, ids_l, None, None, None)
 }
 
 pub(super) fn forward_prepared(
@@ -180,6 +214,7 @@ pub(super) fn forward_prepared(
         ids_l,
         Some(true),
         Some(&routing.packed),
+        None,
     )
 }
 
@@ -217,6 +252,7 @@ fn forward_impl(
     ids_l: &Layout,
     grouped_override: Option<bool>,
     prepared: Option<&PackedRouting>,
+    task_major_override: Option<bool>,
 ) -> Result<(RocmStorage, Shape)> {
     if !q.device.same_device(&input.device) || !q.device.same_device(&ids.device) {
         crate::bail!(
@@ -316,6 +352,12 @@ fn forward_impl(
             (d.batch, d.topk, d.n).into(),
         ));
     }
+    let task_major = task_major_override.unwrap_or_else(|| use_task_major(&d));
+    let name = if task_major {
+        task_major_kernel_name(q.dtype).expect("every indexed dtype has a task-major entry")
+    } else {
+        name
+    };
     let func = dev.get_or_load_func(name, &kernels::QUANTIZED)?;
 
     let w_ptr = q.data.as_ptr();
@@ -342,11 +384,17 @@ fn forward_impl(
         arg(&k_padded_i),
         arg(&input_dim1_i),
     ];
-    // One block per (output row, batch, routed expert): `blockIdx.x` is the row
-    // and the kernel flattens `(blockIdx.y, blockIdx.z)` into the task id it
-    // indexes `ids` with.
+    // One block per (output row, batch, routed expert). Row-major: `blockIdx.x`
+    // is the row and the kernel flattens `(blockIdx.y, blockIdx.z)` into the
+    // task id it indexes `ids` with. Task-major: `blockIdx.x` is the task id and
+    // `blockIdx.y` the row, so co-scheduled blocks share weight rows.
+    let grid = if task_major {
+        Dim3::new_2d((d.batch * d.topk) as u32, d.n as u32)
+    } else {
+        Dim3::new_3d(d.n as u32, d.batch as u32, d.topk as u32)
+    };
     func.launch(
-        Dim3::new_3d(d.n as u32, d.batch as u32, d.topk as u32),
+        grid,
         Dim3::new_2d(WARP_SIZE as u32, NWARPS as u32),
         0,
         Some(dev.stream()),
@@ -540,6 +588,43 @@ fn forward_for_test(
                 ids.layout(),
                 Some(grouped),
                 None,
+                None,
+            )?;
+            Ok(crate::tensor::from_storage(
+                crate::Storage::Rocm(out),
+                shape,
+                crate::op::BackpropOp::none(),
+                false,
+            ))
+        }
+        _ => crate::bail!("test expects ROCm weights and tensors"),
+    }
+}
+
+/// The vector path with an explicit launch geometry.
+#[cfg(test)]
+fn forward_vector_for_test(
+    w: &crate::quantized::QTensor,
+    x: &crate::Tensor,
+    ids: &crate::Tensor,
+    task_major: bool,
+) -> Result<crate::Tensor> {
+    match (&w.storage, &*x.storage(), &*ids.storage()) {
+        (
+            crate::quantized::QStorage::Rocm(q),
+            crate::Storage::Rocm(x_s),
+            crate::Storage::Rocm(ids_s),
+        ) => {
+            let (out, shape) = forward_impl(
+                q,
+                w.shape(),
+                x_s,
+                x.layout(),
+                ids_s,
+                ids.layout(),
+                Some(false),
+                None,
+                Some(task_major),
             )?;
             Ok(crate::tensor::from_storage(
                 crate::Storage::Rocm(out),

@@ -625,3 +625,107 @@ fn prepared_routing_rejects_bad_ids_weights_and_devices_rocm() -> Result<()> {
     assert!(!weights.supports_grouped_moe(1, 2));
     Ok(())
 }
+
+/// Task-major launch geometry computes every output with the same block and
+/// the same reduction as the row-major one, so the bits must match; the CPU
+/// comparisons above cover the values themselves. Shared (gate/up) and
+/// per-expert (down) inputs, a lone token and decode-sized batches.
+#[test]
+fn indexed_moe_task_major_is_bit_identical_to_row_major_rocm() -> Result<()> {
+    let device = rocm_device!();
+    for dtype in MOE_DTYPES {
+        for (batch, topk, input_dim1) in [(1, 1, 1), (3, 2, 1), (3, 2, 2), (17, 4, 1), (32, 4, 4)] {
+            let (experts, n, k) = (8, 96, 256);
+            let w = Tensor::from_vec(ramp(experts * n * k, 61.), (experts, n, k), &Device::Cpu)?;
+            let qw = QTensor::quantize(&w.to_device(&device)?, dtype)?;
+            let x = Tensor::from_vec(
+                ramp(batch * input_dim1 * k, 43.),
+                (batch, input_dim1, k),
+                &device,
+            )?;
+            let ids = Tensor::from_vec(
+                (0..batch * topk)
+                    .map(|i| ((i * 5 + 3) % experts) as u32)
+                    .collect::<Vec<_>>(),
+                (batch, topk),
+                &device,
+            )?;
+            let row = super::forward_vector_for_test(&qw, &x, &ids, false)?;
+            let task = super::forward_vector_for_test(&qw, &x, &ids, true)?;
+            assert_eq!(row.dims(), task.dims());
+            assert_eq!(
+                row.flatten_all()?.to_vec1::<f32>()?,
+                task.flatten_all()?.to_vec1::<f32>()?,
+                "{dtype:?} batch={batch} topk={topk} input_dim1={input_dim1}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn task_major_geometry_starts_at_sixteen_tokens() {
+    let mut d = super::Dims {
+        num_experts: 32,
+        n: 3584,
+        k: 2048,
+        batch: 1,
+        topk: 4,
+        input_dim1: 1,
+    };
+    assert!(!super::use_task_major(&d));
+    d.batch = 15;
+    assert!(!super::use_task_major(&d));
+    d.batch = 16;
+    assert!(super::use_task_major(&d));
+}
+
+/// Decode-sized batches at the LFM2.5 expert shapes, row- vs task-major. Wall
+/// clock with synchronisation, activation quantization included.
+#[test]
+#[ignore = "manual timing run on ROCm GPU"]
+fn bench_task_major_moe_lfm25_rocm() -> Result<()> {
+    let dev = Device::new_rocm(0)?;
+    for (dtype, n, k, slots) in [
+        (GgmlDType::Q5K, 3584, 2048, 1),
+        (GgmlDType::Q6K, 2048, 1792, 4),
+    ] {
+        let dense = Tensor::from_vec(ramp(32 * n * k, 61.), (32, n, k), &Device::Cpu)?;
+        let weights = QTensor::quantize_onto(&dense, dtype, &dev)?;
+        for batch in [1, 2, 4, 8, 16, 32] {
+            let input = Tensor::from_vec(ramp(batch * slots * k, 43.), (batch, slots, k), &dev)?;
+            // Distinct experts within a token, spread across tokens.
+            let ids = Tensor::from_vec(
+                (0..batch * 4)
+                    .map(|i| ((i / 4 * 11 + (i % 4) * 8 + i / 20) % 32) as u32)
+                    .collect::<Vec<_>>(),
+                (batch, 4),
+                &dev,
+            )?;
+            let mut times = [Vec::new(), Vec::new()];
+            for round in 0..21 {
+                for task_major in if round % 2 == 0 {
+                    [false, true]
+                } else {
+                    [true, false]
+                } {
+                    dev.synchronize()?;
+                    let start = std::time::Instant::now();
+                    let out = super::forward_vector_for_test(&weights, &input, &ids, task_major)?;
+                    dev.synchronize()?;
+                    let elapsed = start.elapsed().as_secs_f64() * 1000.;
+                    std::hint::black_box(out);
+                    if round > 0 {
+                        times[usize::from(task_major)].push(elapsed);
+                    }
+                }
+            }
+            for t in &mut times {
+                t.sort_by(f64::total_cmp);
+            }
+            let (row, task) = (times[0][10], times[1][10]);
+            println!("TASK_MAJOR_TIMING dtype={dtype:?} n={n} k={k} batch={batch} row_major_ms={row:.4} task_major_ms={task:.4} speedup={:.3}", row / task);
+        }
+    }
+    Ok(())
+}
