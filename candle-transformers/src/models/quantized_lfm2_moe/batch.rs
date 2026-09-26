@@ -720,6 +720,54 @@ mod rocm_real {
         Ok(())
     }
 
+    /// A short, repeatable decode timing for process-level A/B runs (kernel
+    /// geometry, env switches): 8 prompts at 512 tokens, 40 timed steps at each
+    /// B in LFM25_AB_BS (default 1,8,32). Prints one line per B.
+    #[test]
+    #[ignore = "bench: requires ROCm, LFM25_GGUF, LFM25_PROMPTS"]
+    fn rocm_decode_ab_quick() -> Result<()> {
+        let device = Device::new_rocm(0)?;
+        let model = load(&device)?;
+        let spec: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(env("LFM25_PROMPTS"))?).unwrap();
+        let prompts: Vec<Vec<u32>> = serde_json::from_value(spec["prompts"].clone()).unwrap();
+        let bs: Vec<usize> = std::env::var("LFM25_AB_BS")
+            .unwrap_or("1,8,32".into())
+            .split(',')
+            .map(|v| v.parse().unwrap())
+            .collect();
+        let pool: Vec<State> = prompts
+            .iter()
+            .filter(|p| p.len() > 512)
+            .take(8)
+            .map(|p| prefill(&model, p, &[512]).map(|mut v| v.remove(0)))
+            .collect::<Result<_>>()?;
+        for b in bs {
+            memory_guard()?;
+            let mut rows: Vec<State> = (0..b).map(|i| pool[i % pool.len()].clone()).collect();
+            let mut tokens = vec![1u32; b];
+            let mut ms = Vec::new();
+            for step in 0..45 {
+                let t = Instant::now();
+                let mut refs: Vec<&mut State> = rows.iter_mut().collect();
+                tokens = model
+                    .decode_batch(&tokens, &mut refs)?
+                    .argmax(D::Minus1)?
+                    .to_vec1::<u32>()?;
+                if step >= 5 {
+                    ms.push(t.elapsed().as_secs_f64() * 1e3);
+                }
+            }
+            let p50 = pct(&mut ms, 0.5);
+            eprintln!(
+                "AB B={b} step_ms_p50={p50:.3} min={:.3} tok_per_s={:.1}",
+                pct(&mut ms, 0.0),
+                b as f64 * 1e3 / p50
+            );
+        }
+        Ok(())
+    }
+
     #[test]
     #[ignore = "profile: requires ROCm, LFM25_GGUF, LFM25_PROMPTS"]
     fn rocm_decode_batch_profile() -> Result<()> {

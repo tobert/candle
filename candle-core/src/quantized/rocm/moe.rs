@@ -125,21 +125,40 @@ fn task_major_kernel_name(dtype: GgmlDType) -> Option<&'static str> {
     Some(name)
 }
 
-/// Task-major geometry from 16 tokens up (batched decode), where tokens'
-/// routed pairs sharing expert rows through the cache pays: measured on
-/// gfx1151 at the LFM2.5 shapes, 1.15x at 16 and 1.26-1.30x at 32, but a
-/// 4-17% loss at 2-4 tokens, where there is little to share.
-/// `CANDLE_ROCM_MOE_ROW_MAJOR=1` keeps the original geometry, for A/B runs.
-const TASK_MAJOR_MIN_BATCH: usize = 16;
-
+/// When the launcher picks task-major geometry, with [`task_major_rows`] rows
+/// per block: from 8 tokens up. Interleaved micro-bench on gfx1151 at the
+/// LFM2.5 expert shapes (Q5K 3584x2048 shared input, Q6K 2048x1792 per-pair
+/// input; medians of 20 rotating rounds, three runs), task-major with 8 rows
+/// against row-major: 8 tokens ~10% faster, 16 tokens 20-25%, 32 tokens 1.6x;
+/// 2 and 4 tokens mixed to 5-22% slower. One token was 7-15% faster in the
+/// micro-bench but ~1.5% slower per full decode step (min of three
+/// alternating process runs), so it stays row-major; full batched decode
+/// steps were ~6% faster at 8 and 16 rows and ~14% at 32. Values are
+/// identical either way. `CANDLE_ROCM_MOE_ROW_MAJOR=1` keeps the original
+/// geometry everywhere, for A/B runs.
 fn use_task_major(d: &Dims) -> bool {
     static ROW_MAJOR: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let row_major = *ROW_MAJOR.get_or_init(|| {
         std::env::var("CANDLE_ROCM_MOE_ROW_MAJOR").is_ok_and(|v| v != "0" && !v.is_empty())
     });
-    // Rows move to grid y, whose HIP limit is 65535 blocks.
-    d.batch >= TASK_MAJOR_MIN_BATCH && d.n <= 65535 && !row_major
+    // Row blocks move to grid y, whose HIP limit is 65535 blocks.
+    d.batch >= TASK_MAJOR_MIN_BATCH && d.n.div_ceil(task_major_rows()) <= 65535 && !row_major
 }
+
+/// Rows per task-major block. `CANDLE_ROCM_MOE_TASK_ROWS` overrides it for
+/// tuning runs.
+fn task_major_rows() -> usize {
+    static ROWS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *ROWS.get_or_init(|| {
+        std::env::var("CANDLE_ROCM_MOE_TASK_ROWS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&r| r > 0)
+            .unwrap_or(TASK_MAJOR_ROWS)
+    })
+}
+const TASK_MAJOR_ROWS: usize = 8;
+const TASK_MAJOR_MIN_BATCH: usize = 8;
 
 /// The shapes the kernel launch is derived from, once validated.
 struct Dims {
@@ -253,7 +272,8 @@ fn forward_impl(
     ids_l: &Layout,
     grouped_override: Option<bool>,
     prepared: Option<&PackedRouting>,
-    task_major_override: Option<bool>,
+    // Some(0): row-major; Some(r): task-major with r rows per block.
+    task_major_override: Option<usize>,
 ) -> Result<(RocmStorage, Shape)> {
     if !q.device.same_device(&input.device) || !q.device.same_device(&ids.device) {
         crate::bail!(
@@ -353,7 +373,14 @@ fn forward_impl(
             (d.batch, d.topk, d.n).into(),
         ));
     }
-    let task_major = task_major_override.unwrap_or_else(|| use_task_major(&d));
+    let rows_per_block = task_major_override.unwrap_or_else(|| {
+        if use_task_major(&d) {
+            task_major_rows()
+        } else {
+            0
+        }
+    });
+    let task_major = rows_per_block > 0;
     let name = if task_major {
         task_major_kernel_name(q.dtype).expect("every indexed dtype has a task-major entry")
     } else {
@@ -373,6 +400,7 @@ fn forward_impl(
     let topk_i = d.topk as i32;
     let k_padded_i = k_padded as i32;
     let input_dim1_i = d.input_dim1 as i32;
+    let rows_i = rows_per_block as i32;
     let mut args = vec![
         arg(&w_ptr),
         arg(&y_ptr),
@@ -389,8 +417,15 @@ fn forward_impl(
     // is the row and the kernel flattens `(blockIdx.y, blockIdx.z)` into the
     // task id it indexes `ids` with. Task-major: `blockIdx.x` is the task id and
     // `blockIdx.y` the row, so co-scheduled blocks share weight rows.
+    // Task-major blocks may compute several consecutive rows each.
+    if task_major {
+        args.push(arg(&rows_i));
+    }
     let grid = if task_major {
-        Dim3::new_2d((d.batch * d.topk) as u32, d.n as u32)
+        Dim3::new_2d(
+            (d.batch * d.topk) as u32,
+            d.n.div_ceil(rows_per_block) as u32,
+        )
     } else {
         Dim3::new_3d(d.n as u32, d.batch as u32, d.topk as u32)
     };
@@ -608,7 +643,7 @@ fn forward_vector_for_test(
     w: &crate::quantized::QTensor,
     x: &crate::Tensor,
     ids: &crate::Tensor,
-    task_major: bool,
+    rows_per_block: usize, // 0: row-major
 ) -> Result<crate::Tensor> {
     match (&w.storage, &*x.storage(), &*ids.storage()) {
         (
@@ -625,7 +660,7 @@ fn forward_vector_for_test(
                 ids.layout(),
                 Some(false),
                 None,
-                Some(task_major),
+                Some(rows_per_block),
             )?;
             Ok(crate::tensor::from_storage(
                 crate::Storage::Rocm(out),

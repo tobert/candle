@@ -650,21 +650,31 @@ fn indexed_moe_task_major_is_bit_identical_to_row_major_rocm() -> Result<()> {
                 (batch, topk),
                 &device,
             )?;
-            let row = super::forward_vector_for_test(&qw, &x, &ids, false)?;
-            let task = super::forward_vector_for_test(&qw, &x, &ids, true)?;
-            assert_eq!(row.dims(), task.dims());
-            assert_eq!(
-                row.flatten_all()?.to_vec1::<f32>()?,
-                task.flatten_all()?.to_vec1::<f32>()?,
-                "{dtype:?} batch={batch} topk={topk} input_dim1={input_dim1}"
-            );
+            // Poisoned outputs: an unwritten element cannot pass as the stale
+            // result of the previous call in a reused allocation.
+            let row = with_work_buffer_pattern(0x7f, || {
+                super::forward_vector_for_test(&qw, &x, &ids, 0)
+            })?;
+            let row = row.flatten_all()?.to_vec1::<f32>()?;
+            // 7 does not divide n = 96: the last block runs short.
+            for rows in [1, 2, 4, 7, 8] {
+                let task = with_work_buffer_pattern(0x7f, || {
+                    super::forward_vector_for_test(&qw, &x, &ids, rows)
+                })?;
+                assert_eq!(task.dims(), [batch, topk, n]);
+                assert_eq!(
+                    row,
+                    task.flatten_all()?.to_vec1::<f32>()?,
+                    "{dtype:?} batch={batch} topk={topk} input_dim1={input_dim1} rows={rows}"
+                );
+            }
         }
     }
     Ok(())
 }
 
 #[test]
-fn task_major_geometry_starts_at_sixteen_tokens() {
+fn task_major_geometry_starts_at_eight_tokens() {
     let mut d = super::Dims {
         num_experts: 32,
         n: 3584,
@@ -673,12 +683,16 @@ fn task_major_geometry_starts_at_sixteen_tokens() {
         topk: 4,
         input_dim1: 1,
     };
-    assert!(!super::use_task_major(&d));
-    d.batch = 15;
-    assert!(!super::use_task_major(&d));
-    d.batch = 16;
-    assert!(super::use_task_major(&d));
-    d.n = 65536;
+    let picks: Vec<bool> = [1, 2, 4, 7, 8, 16, 32, 63]
+        .iter()
+        .map(|&b| {
+            d.batch = b;
+            super::use_task_major(&d)
+        })
+        .collect();
+    assert_eq!(picks, [false, false, false, false, true, true, true, true]);
+    d.batch = 8;
+    d.n = 65535 * super::TASK_MAJOR_ROWS + 1;
     assert!(!super::use_task_major(&d));
 }
 
@@ -704,29 +718,49 @@ fn bench_task_major_moe_lfm25_rocm() -> Result<()> {
                 (batch, 4),
                 &dev,
             )?;
-            let mut times = [Vec::new(), Vec::new()];
+            // 0 = row-major; r > 0 = task-major with r rows per block. The
+            // order rotates every round so drift in a shared GPU spreads out.
+            let variants = [0usize, 1, 2, 4, 8, 16];
+            let mut times = vec![Vec::new(); variants.len()];
             for round in 0..21 {
-                for task_major in if round % 2 == 0 {
-                    [false, true]
-                } else {
-                    [true, false]
-                } {
+                for j in 0..variants.len() {
+                    let v = (j + round) % variants.len();
                     dev.synchronize()?;
                     let start = std::time::Instant::now();
-                    let out = super::forward_vector_for_test(&weights, &input, &ids, task_major)?;
+                    let out = super::forward_vector_for_test(&weights, &input, &ids, variants[v])?;
                     dev.synchronize()?;
                     let elapsed = start.elapsed().as_secs_f64() * 1000.;
                     std::hint::black_box(out);
                     if round > 0 {
-                        times[usize::from(task_major)].push(elapsed);
+                        times[v].push(elapsed);
                     }
                 }
             }
-            for t in &mut times {
-                t.sort_by(f64::total_cmp);
-            }
-            let (row, task) = (times[0][10], times[1][10]);
-            println!("TASK_MAJOR_TIMING dtype={dtype:?} n={n} k={k} batch={batch} row_major_ms={row:.4} task_major_ms={task:.4} speedup={:.3}", row / task);
+            let medians: Vec<f64> = times
+                .iter_mut()
+                .map(|t| {
+                    t.sort_by(f64::total_cmp);
+                    t[t.len() / 2]
+                })
+                .collect();
+            let cells: Vec<String> = variants
+                .iter()
+                .zip(&medians)
+                .map(|(v, m)| {
+                    format!(
+                        "{}={m:.4}",
+                        if *v == 0 {
+                            "row".into()
+                        } else {
+                            format!("task{v}")
+                        }
+                    )
+                })
+                .collect();
+            println!(
+                "TASK_MAJOR_TIMING dtype={dtype:?} n={n} k={k} batch={batch} ms: {}",
+                cells.join(" ")
+            );
         }
     }
     Ok(())

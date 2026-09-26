@@ -4800,7 +4800,8 @@ __device__ void indexed_moe_forward(
     const int batch,
     const int topk,
     const int k_padded,
-    const int input_dim1) {
+    const int input_dim1,
+    const int rows_per_block = 1) {
 
     int current_batch, task_id, row_block;
     if (task_major) {
@@ -4853,20 +4854,24 @@ __device__ void indexed_moe_forward(
     constexpr int rows_per_cuda_block = 1;
 
     const int tid = WARP_SIZE * threadIdx.y + threadIdx.x;
-    const int row0 = rows_per_cuda_block * row_block; // the row within the task
-
-    if (row0 >= n) {
-        return;
-    }
-
     const int blocks_per_row_x = k / qk;
     const int blocks_per_col_y = k_padded / QK8_1;
     constexpr int blocks_per_iter = vdr * nwarps * WARP_SIZE / qi;
-
-    float tmp = 0.0f;
-
     const block_q_t * w = (const block_q_t *) current_weight_ptr;
     const block_q8_1 * x = (const block_q8_1 *) current_input_ptr;
+    __shared__ float tmp_shared[nwarps - 1][WARP_SIZE];
+
+    // A block may compute several consecutive rows, one after another, each
+    // with exactly the single-row reduction. The row index is uniform across
+    // the block, so the break is too.
+    for (int r = 0; r < rows_per_block; ++r) {
+    const int row0 = rows_per_cuda_block * (row_block * rows_per_block + r); // the row within the task
+
+    if (row0 >= n) {
+        break;
+    }
+
+    float tmp = 0.0f;
 
     for (int kbx = tid / (qi / vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
         const int kby = kbx * (qk / QK8_1);
@@ -4875,7 +4880,6 @@ __device__ void indexed_moe_forward(
     }
 
     // --- Inter-warp reduction using shared memory ---
-    __shared__ float tmp_shared[nwarps - 1][WARP_SIZE];
     if (threadIdx.y > 0) {
         tmp_shared[threadIdx.y - 1][threadIdx.x] = tmp;
     }
@@ -4889,6 +4893,9 @@ __device__ void indexed_moe_forward(
         if (threadIdx.x == 0) {
             current_output_ptr[row0] = tmp;
         }
+    }
+    // tmp_shared is rewritten by the next row.
+    __syncthreads();
     }
 }
 
@@ -5043,15 +5050,15 @@ extern "C" __global__ void indexed_moe_forward_q5_1_q8_1(
 }
 
 // Task-major launch geometry for the same computation; see `indexed_moe_forward`.
-// Grid: (batch * topk, n). The launcher opts into these.
+// Grid: (batch * topk, ceil(n / rows_per_block)). The launcher opts into these.
 #define INDEXED_MOE_TASK_MAJOR(name, qk, qi, block_t, vdr, dot)                         \
 extern "C" __global__ void name(                                                         \
     const void * __restrict__ all_weights, const void * __restrict__ all_inputs,         \
     const unsigned int * __restrict__ indices, float * __restrict__ all_outputs,         \
     const int n, const int k, const int batch, const int topk, const int k_padded,       \
-    const int input_dim1) {                                                              \
+    const int input_dim1, const int rows_per_block) {                                    \
     indexed_moe_forward<qk, qi, block_t, vdr, dot, true>                                 \
-        (all_weights, all_inputs, indices, all_outputs, n, k, batch, topk, k_padded, input_dim1); \
+        (all_weights, all_inputs, indices, all_outputs, n, k, batch, topk, k_padded, input_dim1, rows_per_block); \
 }
 INDEXED_MOE_TASK_MAJOR(indexed_moe_forward_task_major_q2k_q8_1, QK_K, QI2_K, block_q2_K, VDR_Q2_K_Q8_1_MMVQ, vec_dot_q2_K_q8_1)
 INDEXED_MOE_TASK_MAJOR(indexed_moe_forward_task_major_q3k_q8_1, QK_K, QI3_K, block_q3_K, VDR_Q3_K_Q8_1_MMVQ, vec_dot_q3_K_q8_1)
