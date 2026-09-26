@@ -282,3 +282,56 @@ test_device!(
     broadcast_matmul_rank2_rhs_metal,
     broadcast_matmul_rank2_rhs_rocm
 );
+
+/// A batched matmul with one side broadcast over the batch, against each batch
+/// computed alone from contiguous copies. The layouts are the ones the CPU
+/// backend used to fold into a single GEMM without checking that the folded
+/// rows (or columns) are evenly strided: a `(b, 1, k)` lhs whose size-one dim
+/// carries stride 1 (what `(b, k, 1).transpose(1, 2).contiguous()` gives, and
+/// is_contiguous accepts), a transposed lhs, and a broadcast lhs with m > 1.
+fn broadcast_matmul_folds(device: &Device) -> Result<()> {
+    let ramp = |n: usize, s: f32| -> Vec<f32> { (0..n).map(|i| (i as f32 * s).sin()).collect() };
+    let check = |lhs: &Tensor, rhs: &Tensor, what: &str| -> Result<()> {
+        let got = lhs.matmul(rhs)?;
+        let b = got.dim(0)?;
+        for i in 0..b {
+            let want = lhs.i(i)?.contiguous()?.matmul(&rhs.i(i)?.contiguous()?)?;
+            let (g, w) = (got.i(i)?.flatten_all()?.to_vec1::<f32>()?, want.flatten_all()?.to_vec1::<f32>()?);
+            for (a, e) in g.iter().zip(&w) {
+                assert!((a - e).abs() < 1e-5, "{what}: batch {i}: {g:?} vs {w:?}");
+            }
+        }
+        Ok(())
+    };
+    let (b, m, n, k) = (3, 4, 5, 8);
+    let w = Tensor::from_vec(ramp(n * k, 0.7), (n, k), device)?;
+    // (b, 1, k) with stride 1 on its size-one dim, against a broadcast rhs.
+    let x = Tensor::from_vec(ramp(b * k, 0.3), (b, k, 1), device)?
+        .transpose(1, 2)?
+        .contiguous()?;
+    assert!(x.is_contiguous());
+    check(&x, &w.broadcast_left(b)?.t()?, "size-one lhs, broadcast rhs")?;
+    // A transposed lhs (b, m, k) against a broadcast rhs.
+    let xt = Tensor::from_vec(ramp(b * m * k, 0.2), (b, k, m), device)?.transpose(1, 2)?;
+    check(&xt, &w.broadcast_left(b)?.t()?, "transposed lhs, broadcast rhs")?;
+    // A broadcast lhs with m > 1 against a batched rhs, plain and transposed.
+    let a = Tensor::from_vec(ramp(m * k, 0.9), (m, k), device)?.broadcast_left(b)?;
+    let r = Tensor::from_vec(ramp(b * k * n, 0.4), (b, k, n), device)?;
+    check(&a, &r, "broadcast lhs m>1")?;
+    let rt = Tensor::from_vec(ramp(b * n * k, 0.4), (b, n, k), device)?.transpose(1, 2)?;
+    check(&a, &rt, "broadcast lhs m>1, transposed rhs")?;
+    // And m == 1 with a (b, k, 1) rhs whose size-one dim carries stride 1.
+    let a1 = Tensor::from_vec(ramp(k, 0.9), (1, k), device)?.broadcast_left(b)?;
+    let r1 = Tensor::from_vec(ramp(b * k, 0.5), (b, 1, k), device)?
+        .transpose(1, 2)?
+        .contiguous()?;
+    check(&a1, &r1, "broadcast lhs m=1, size-one rhs")?;
+    Ok(())
+}
+test_device!(
+    broadcast_matmul_folds,
+    broadcast_matmul_folds_cpu,
+    broadcast_matmul_folds_gpu,
+    broadcast_matmul_folds_metal,
+    broadcast_matmul_folds_rocm
+);

@@ -1485,15 +1485,21 @@ impl Map2 for MatMul {
         } else {
             Parallelism::None
         };
-        let (b, m, n, k) = if b_skip == 0 && a_skip == m * k {
-            // a_skip and c_skip should be updated but step is always 0 so
-            // it wouldn't matter.
-            (1, b * m, n, k)
-        } else if a_skip == 0 && b_skip == n * k {
-            (1, m, b * n, k)
-        } else {
-            (b, m, n, k)
-        };
+        // Fold the batch into one GEMM only when the folded operand stays evenly
+        // strided. Folding into m needs lhs rows k apart; a size-one m may carry
+        // any row stride (is_contiguous ignores it), so it takes k. Folding into
+        // n likewise needs rhs columns k apart, and m == 1, since dst is
+        // (b, m, n), not (m, b * n).
+        let (b, m, n, k, lhs_rs, rhs_cs) =
+            if b_skip == 0 && a_skip == m * k && (m == 1 || lhs_rs == k) {
+                // a_skip and c_skip should be updated but step is always 0 so
+                // it wouldn't matter.
+                (1, b * m, n, k, k, rhs_cs)
+            } else if a_skip == 0 && b_skip == n * k && m == 1 && (n == 1 || rhs_cs == k) {
+                (1, m, b * n, k, lhs_rs, k)
+            } else {
+                (b, m, n, k, lhs_rs, rhs_cs)
+            };
         for step in 0..b {
             let lhs_p = &lhs[step * a_skip..];
             let rhs_p = &rhs[step * b_skip..];

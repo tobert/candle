@@ -103,12 +103,12 @@ fn conv1d_with_an_offset_input() -> Result<()> {
 /// naive `conv_transpose1d` kernel.
 ///
 /// The two paths are compared against each other rather than against the CPU
-/// for `b_size > 1`: `cpu_backend`'s `MatMul::f` collapses a batched GEMM whose
-/// rhs is broadcast (`b_skip == 0 && a_skip == m * k`) into one `(1, b*m, n, k)`
-/// call without also requiring `lhs_rs == k`, so a transposed lhs — exactly what
-/// col2im passes — makes the CPU read the wrong rows from batch 1 on. Verified
-/// against a from-the-definition reference: the GPU is the one that is right.
-/// The CPU comparisons below therefore use a single batch.
+/// for `b_size > 1`. When this was written, `cpu_backend`'s `MatMul::f` folded a
+/// batched GEMM with a broadcast rhs into one `(1, b*m, n, k)` call without
+/// requiring evenly strided lhs rows, so a transposed lhs — exactly what col2im
+/// passes — read the wrong rows from batch 1 on (the GPU was right). That fold
+/// is now guarded and pinned by `matmul_tests::broadcast_matmul_folds`; the CPU
+/// comparisons below still use a single batch.
 #[test]
 fn conv_transpose1d_covers_both_paths() -> Result<()> {
     let dev = rocm_device!();
