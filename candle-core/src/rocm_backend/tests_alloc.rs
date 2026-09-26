@@ -74,3 +74,31 @@ fn an_empty_allocation_is_null_and_is_not_recycled() -> Result<()> {
     assert!(!dev.alloc::<f32>(1)?.as_ptr().is_null());
     Ok(())
 }
+
+/// A buffer that grows a little on every call — attention scores over a
+/// growing KV length are the common case — must keep landing in a few
+/// buckets. With fixed 1 MiB buckets every step here took a new one and the
+/// free list parked all 64 of them (2144 MiB for a 64 MiB buffer), growth
+/// that is quadratic in the final size. With four classes per octave, one
+/// parked block per class sums to 3.25x each octave's top, a geometric
+/// series: under 8x the largest request (477 MiB here).
+#[test]
+fn a_growing_buffer_parks_a_bounded_multiple_of_its_largest_size() -> Result<()> {
+    let dev = device!();
+    let before = dev.allocator.parked_bytes();
+    let mut largest = 0;
+    for step in 1..=64usize {
+        let bytes = step * ((1 << 20) + 4096);
+        let block = dev.alloc::<u8>(bytes)?;
+        largest = largest.max(bytes);
+        drop(block);
+    }
+    let parked = dev.allocator.parked_bytes() - before;
+    assert!(
+        parked < 8 * largest,
+        "parked {} MiB for a buffer that peaked at {} MiB",
+        parked >> 20,
+        largest >> 20
+    );
+    Ok(())
+}

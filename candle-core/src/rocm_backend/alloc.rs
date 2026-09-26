@@ -55,24 +55,38 @@ fn hip_check(status: bindings::hipError_t) -> Result<(), HipError> {
     }
 }
 
-/// Allocation granularity below and above [`LARGE_BLOCK`].
+/// Allocation granularity up to [`GEOMETRIC_FROM`].
 ///
 /// Rounding up means two tensors of *similar* size share a bucket instead of
 /// each forcing a fresh `hipMalloc`. 512 B matches the driver's own alignment,
-/// so small buffers waste nothing that was not already padding; 1 MiB on large
-/// ones caps the waste at 0.1% of a 1 GiB block while still collapsing the
-/// near-misses a varying batch size produces.
+/// so small buffers waste nothing that was not already padding.
 const SMALL_GRANULARITY: usize = 512;
-const LARGE_GRANULARITY: usize = 1 << 20;
+#[cfg(test)]
 const LARGE_BLOCK: usize = 1 << 20;
 
+/// Above this, buckets are geometric size classes rather than a fixed
+/// granularity.
+const GEOMETRIC_FROM: usize = 64 << 10;
+
+/// Size classes per power-of-two octave above [`GEOMETRIC_FROM`].
+///
+/// A fixed granularity gives a tensor that grows a little on every call a new
+/// bucket on every call, and a parked block is only reused by its own bucket.
+/// Attention scores over a growing KV length are exactly that shape
+/// (`heads x query_len x kv_len`, one prefill chunk or one decoded token
+/// longer each step): with 1 MiB buckets a chunked prefill parked one set of
+/// score buffers per chunk, so parked memory grew with the square of the
+/// context. Geometric classes let a growing size touch only
+/// `CLASSES_PER_OCTAVE` buckets per doubling, which bounds what it parks to a
+/// small multiple of its largest size, for at most 25% rounding.
+const CLASSES_PER_OCTAVE: usize = 4;
+
 fn bucket_size(size: usize) -> usize {
-    let granularity = if size <= LARGE_BLOCK {
-        SMALL_GRANULARITY
-    } else {
-        LARGE_GRANULARITY
-    };
-    size.div_ceil(granularity) * granularity
+    if size > GEOMETRIC_FROM {
+        let step = size.next_power_of_two() / (2 * CLASSES_PER_OCTAVE);
+        return size.div_ceil(step) * step;
+    }
+    size.div_ceil(SMALL_GRANULARITY) * SMALL_GRANULARITY
 }
 
 /// A device pointer parked on the free list.
@@ -142,6 +156,12 @@ impl RocmAllocator {
                 raw_malloc(bucket).map(|ptr| (ptr, bucket)).map_err(|_| e)
             }
         }
+    }
+
+    /// Bytes parked on the free list: held from the driver, owned by no tensor.
+    #[cfg(test)]
+    pub(crate) fn parked_bytes(&self) -> usize {
+        self.lock_free().iter().map(|(bucket, blocks)| bucket * blocks.len()).sum()
     }
 
     /// Park a block for reuse. Never calls `hipFree`, and so never blocks.
@@ -357,17 +377,32 @@ impl<T> Drop for SendSyncDeviceMemory<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::{bucket_size, LARGE_BLOCK, LARGE_GRANULARITY, SMALL_GRANULARITY};
+    use super::{bucket_size, GEOMETRIC_FROM, LARGE_BLOCK, SMALL_GRANULARITY};
 
     #[test]
     fn buckets_round_up_to_the_granularity() {
         assert_eq!(bucket_size(1), SMALL_GRANULARITY);
         assert_eq!(bucket_size(SMALL_GRANULARITY), SMALL_GRANULARITY);
         assert_eq!(bucket_size(SMALL_GRANULARITY + 1), 2 * SMALL_GRANULARITY);
+        assert_eq!(bucket_size(GEOMETRIC_FROM), GEOMETRIC_FROM);
+        // Above that, four classes per octave: (1, 1.25, 1.5, 1.75) x 2^k.
         assert_eq!(bucket_size(LARGE_BLOCK), LARGE_BLOCK);
-        // Just past the small/large boundary the granularity jumps, so a 1 MiB
-        // + 1 byte request rounds to 2 MiB rather than to 1 MiB + 512 B.
-        assert_eq!(bucket_size(LARGE_BLOCK + 1), 2 * LARGE_GRANULARITY);
+        assert_eq!(bucket_size(LARGE_BLOCK + 1), LARGE_BLOCK + LARGE_BLOCK / 4);
+        assert_eq!(bucket_size(3 * LARGE_BLOCK / 2), 3 * LARGE_BLOCK / 2);
+        assert_eq!(bucket_size(2 * LARGE_BLOCK - 1), 2 * LARGE_BLOCK);
+    }
+
+    #[test]
+    fn a_growing_size_touches_a_few_buckets_per_doubling_and_rounds_under_a_quarter() {
+        // Attention scores in a 128-token-chunk prefill to 32k tokens:
+        // 32 heads x 128 rows x kv_len x f32.
+        let sizes: Vec<usize> = (1..=256).map(|chunk| 32 * 128 * (chunk * 128) * 4).collect();
+        let buckets: std::collections::BTreeSet<usize> = sizes.iter().map(|&s| bucket_size(s)).collect();
+        assert!(buckets.len() <= 4 * 9, "{} buckets", buckets.len());
+        for s in sizes {
+            let b = bucket_size(s);
+            assert!(b >= s && (b - s) * 4 <= s, "{s} -> {b}");
+        }
     }
 
     /// Two tensors of the same shape must land in the same bucket, or the free
