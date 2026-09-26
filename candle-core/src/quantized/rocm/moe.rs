@@ -137,7 +137,8 @@ fn use_task_major(d: &Dims) -> bool {
     let row_major = *ROW_MAJOR.get_or_init(|| {
         std::env::var("CANDLE_ROCM_MOE_ROW_MAJOR").is_ok_and(|v| v != "0" && !v.is_empty())
     });
-    d.batch >= TASK_MAJOR_MIN_BATCH && !row_major
+    // Rows move to grid y, whose HIP limit is 65535 blocks.
+    d.batch >= TASK_MAJOR_MIN_BATCH && d.n <= 65535 && !row_major
 }
 
 /// The shapes the kernel launch is derived from, once validated.

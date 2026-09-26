@@ -678,6 +678,8 @@ fn task_major_geometry_starts_at_sixteen_tokens() {
     assert!(!super::use_task_major(&d));
     d.batch = 16;
     assert!(super::use_task_major(&d));
+    d.n = 65536;
+    assert!(!super::use_task_major(&d));
 }
 
 /// Decode-sized batches at the LFM2.5 expert shapes, row- vs task-major. Wall
