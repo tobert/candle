@@ -47,7 +47,7 @@ int run_indexed_moe_q8(CandleSyclQueue *cq, const void *w, const void *act, bool
       // Guard the id here, not on the host: the ids are produced on device and
       // a host check would sync the queue once per MoE layer per token. A bad
       // id stores reason code 1 in the queue's guard flag (reported at the
-      // next synchronize) and reads expert 0 rather than out of bounds.
+      // next synchronize or device-to-host copy) and reads expert 0 rather than out of bounds.
       const uint32_t expert_raw = ids[mi];
       uint32_t expert = expert_raw;
       if (expert_raw >= num_experts) {
@@ -94,7 +94,8 @@ int run_indexed_moe_q8(CandleSyclQueue *cq, const void *w, const void *act, bool
 // `out_f16`. `ids` is `batch * topk` u32 expert ids (one per task, layout
 // matches the CUDA `indexed_moe_forward` `indices` argument). `num_experts`
 // bounds the ids: an id outside `[0, num_experts)` stores reason code 1 in the
-// queue's device guard flag (reported by `candle_sycl_synchronize`) and reads
+// queue's device guard flag (reported by `candle_sycl_synchronize` or
+// the next `candle_sycl_memcpy_dtoh`) and reads
 // expert 0 instead of out of bounds. Scratch has the
 // same shape `candle_sycl_mmvq_q8` takes: `q8` `m*k` bytes, `d8` `m*(k/blk)`
 // f32, `s32` `m*(k/blk)*8` i32, `tmp` `m*n*ceil((k/blk)/ch)` f32 with

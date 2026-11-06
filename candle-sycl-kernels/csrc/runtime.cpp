@@ -155,7 +155,18 @@ int candle_sycl_memcpy_htod(CandleSyclQueue *q, void *dst, const void *src, size
   }
 }
 int candle_sycl_memcpy_dtoh(CandleSyclQueue *q, void *dst, const void *src, size_t bytes) {
-  return candle_sycl_memcpy_htod(q, dst, src, bytes);
+  // A device-to-host copy is where a caller first sees results (lfm2d reads
+  // its logits here and never synchronizes), so it reports the device guard
+  // as `candle_sycl_synchronize` does. The flag read rides on the same wait.
+  try {
+    int32_t peek = 0;
+    if (bytes) q->q.memcpy(dst, src, bytes);
+    if (q->guard) q->q.memcpy(&peek, q->guard, sizeof(peek));
+    q->q.wait_and_throw();
+    return peek ? take_guard(q) : CANDLE_SYCL_OK;
+  } catch (...) {
+    return CANDLE_SYCL_ERR_EXCEPTION;
+  }
 }
 int candle_sycl_memcpy_dtod(CandleSyclQueue *q, void *dst, const void *src, size_t bytes) {
   // Device-to-device: the in-order queue orders this against every later

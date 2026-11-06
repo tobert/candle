@@ -306,7 +306,9 @@ impl Queue {
     /// The internal flushes below must not consume a guard error: a buffer
     /// drop during decode can trigger one, and if it cleared the flag here the
     /// caller's `synchronize` would report nothing and the bad expert id would
-    /// go unseen. Only the public [`Queue::synchronize`] reads and clears it.
+    /// go unseen. Only the public [`Queue::synchronize`] and
+    /// [`DeviceBuffer::copy_to_host`], whose errors reach a caller, read and
+    /// clear it.
     fn wait(&self) -> Result<()> {
         check(unsafe { candle_sycl_wait(self.raw) }, "wait")
     }
@@ -591,6 +593,10 @@ impl DeviceBuffer {
         )
     }
 
+    /// Copy to the host, waiting for all prior work on the queue. Reports (and
+    /// clears) a tripped device guard as [`Queue::synchronize`] does: this is
+    /// the first host-visible point after a decode step, and callers that
+    /// never synchronize must still see a bad expert id.
     pub fn copy_to_host(&self, dst: &mut [u8]) -> Result<()> {
         assert!(dst.len() <= self.len_bytes);
         check(

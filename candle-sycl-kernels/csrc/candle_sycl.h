@@ -22,8 +22,9 @@ typedef enum {
   CANDLE_SYCL_ERR_EXCEPTION = 7,
   // Device-side guard tripped (e.g. an indexed MoE expert id outside the
   // weight stack). The guard's reason code is added to this base: 101 means
-  // "expert id out of range". Reported by candle_sycl_synchronize, which also
-  // clears the flag.
+  // "expert id out of range". Reported by candle_sycl_synchronize and by
+  // candle_sycl_memcpy_dtoh, which clear the flag as they report it (each trip
+  // is reported once). candle_sycl_wait does not read it.
   CANDLE_SYCL_ERR_DEVICE_GUARD_BASE = 100,
 } CandleSyclStatus;
 

@@ -73,6 +73,7 @@ fn indexed_moe_q8_0(dev: &Device) -> Result<()> {
     run_case(dev, GgmlDType::Q5K, 32, 4, true)?;
     bad_expert_id_is_refused(dev)?;
     bad_expert_id_survives_a_pool_flush(dev)?;
+    bad_expert_id_surfaces_at_the_host_read(dev)?;
     grouped_call_reuses_the_dequant_cache(dev)?;
     Ok(())
 }
@@ -193,7 +194,8 @@ fn bad_expert_id_is_refused(dev: &Device) -> Result<()> {
 }
 
 /// The queue's internal pool flushes (64 declined buffers, or 256 MiB) must
-/// not consume a guard error: only `Device::synchronize` reads and clears it.
+/// not consume a guard error: only `Device::synchronize` and device-to-host
+/// copies read and clear it.
 fn bad_expert_id_survives_a_pool_flush(dev: &Device) -> Result<()> {
     if !dev.is_sycl() {
         return Ok(());
@@ -230,6 +232,45 @@ fn bad_expert_id_survives_a_pool_flush(dev: &Device) -> Result<()> {
         "unexpected error: {err}"
     );
     // The guard is cleared when reported: the queue must work again.
+    dev.synchronize()?;
+    Ok(())
+}
+
+/// lfm2d's decode loop never calls `Device::synchronize`: the first host-
+/// visible point after a MoE layer is the logits read. A tripped guard must
+/// surface there, as an error, not as numbers computed with expert 0.
+fn bad_expert_id_surfaces_at_the_host_read(dev: &Device) -> Result<()> {
+    if !dev.is_sycl() {
+        return Ok(());
+    }
+    let cpu = &Device::Cpu;
+    let num_experts = 4usize;
+    let (n, k) = (32usize, 256usize);
+    let w = Tensor::rand(-1f32, 1f32, (num_experts, n, k), cpu)?;
+    let w_q_cpu = QTensor::quantize(&w, GgmlDType::Q5K)?;
+    let bytes = w_q_cpu.data()?.into_owned();
+    let w_q = QTensor::new(
+        candle_core::quantized::QStorage::from_data(
+            std::borrow::Cow::Owned(bytes),
+            dev,
+            GgmlDType::Q5K,
+        )?,
+        w_q_cpu.shape().clone(),
+    )?;
+    let input = Tensor::rand(-1f32, 1f32, (1, k), cpu)?.to_device(dev)?;
+    let ids = Tensor::from_vec(vec![0u32, num_experts as u32], (1, 2), cpu)?.to_device(dev)?;
+    // Trips the device-side guard; the call itself succeeds.
+    let out = w_q.indexed_moe_forward(&input, &ids)?;
+    let err = out
+        .to_device(cpu)
+        .and_then(|t| t.flatten_all()?.to_vec1::<f32>())
+        .expect_err("the device-to-host read must report the tripped guard");
+    assert!(
+        err.to_string().contains("expert"),
+        "unexpected error: {err}"
+    );
+    // Reported once: the next read and sync are clean.
+    out.to_device(cpu)?;
     dev.synchronize()?;
     Ok(())
 }
