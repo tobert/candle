@@ -44,26 +44,42 @@ void candle_sycl_queue_free(CandleSyclQueue *q) { delete q; }
 
 void *candle_sycl_queue_native(CandleSyclQueue *q) { return &q->q; }
 
+} // extern "C"
+
+namespace {
+// Atomically read and clear the guard flag, returning the status it encodes.
+// Call after a host wait has shown the flag nonzero (`peeked`): the common
+// clean case then costs one 4-byte copy riding on a wait the caller pays
+// anyway, and only a trip pays for the exchange kernel. The exchange may find
+// 0 if another thread took the code first; that thread reports it, so this
+// one returns OK and each trip is reported exactly once.
+int take_guard(CandleSyclQueue *q) {
+  std::lock_guard<std::mutex> lock(q->guard_mu);
+  int32_t *g = q->guard;
+  q->q.single_task([=] {
+    g[1] = sycl::atomic_ref<int32_t, sycl::memory_order::relaxed, sycl::memory_scope::device,
+                            sycl::access::address_space::global_space>(g[0])
+               .exchange(0);
+  });
+  int32_t code = 0;
+  q->q.memcpy(&code, g + 1, sizeof(code)).wait_and_throw();
+  return code ? CANDLE_SYCL_ERR_DEVICE_GUARD_BASE + code : CANDLE_SYCL_OK;
+}
+} // namespace
+
+extern "C" {
+
 int candle_sycl_synchronize(CandleSyclQueue *q) {
-  try {
-    q->q.wait_and_throw();
-  } catch (...) {
-    return CANDLE_SYCL_ERR_EXCEPTION;
-  }
-  if (!q->guard) {
-    return CANDLE_SYCL_OK;
-  }
   // A device-side guard (e.g. an indexed MoE expert id outside the stack)
-  // stores its reason code here instead of reading out of bounds. Report it
-  // once, then clear it so the queue stays usable.
+  // stores its reason code instead of reading out of bounds. Report it once,
+  // clearing it so the queue stays usable.
   try {
-    int32_t code = 0;
-    q->q.memcpy(&code, q->guard, sizeof(code)).wait_and_throw();
-    if (code != 0) {
-      q->q.memset(q->guard, 0, sizeof(code)).wait_and_throw();
-      return CANDLE_SYCL_ERR_DEVICE_GUARD_BASE + code;
+    int32_t peek = 0;
+    if (q->guard) {
+      q->q.memcpy(&peek, q->guard, sizeof(peek));
     }
-    return CANDLE_SYCL_OK;
+    q->q.wait_and_throw();
+    return peek ? take_guard(q) : CANDLE_SYCL_OK;
   } catch (...) {
     return CANDLE_SYCL_ERR_EXCEPTION;
   }
