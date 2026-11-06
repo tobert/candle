@@ -187,6 +187,40 @@ fn batched_gemm_matches_loop() {
 }
 
 #[test]
+#[should_panic(expected = "memcpy_dtod")]
+fn copy_from_device_refuses_more_than_the_source_holds() {
+    let q = Queue::new(0).unwrap();
+    let src = DeviceBuffer::alloc(&q, 16).unwrap();
+    let dst = DeviceBuffer::alloc(&q, 64).unwrap();
+    let _ = dst.copy_from_device(&src, 32);
+}
+
+#[test]
+#[should_panic(expected = "memcpy_dtod")]
+fn copy_from_device_refuses_more_than_the_destination_holds() {
+    let q = Queue::new(0).unwrap();
+    let src = DeviceBuffer::alloc(&q, 64).unwrap();
+    let dst = DeviceBuffer::alloc(&q, 16).unwrap();
+    let _ = dst.copy_from_device(&src, 32);
+}
+
+/// Release builds too: a clamped view would silently alias the wrong bytes.
+#[test]
+#[should_panic(expected = "view_at")]
+fn view_at_refuses_an_offset_past_the_end() {
+    let q = Queue::new(0).unwrap();
+    let buf = DeviceBuffer::alloc(&q, 16).unwrap();
+    let _ = unsafe { buf.view_at(17) };
+}
+
+#[test]
+fn view_at_the_end_is_empty() {
+    let q = Queue::new(0).unwrap();
+    let buf = DeviceBuffer::alloc(&q, 16).unwrap();
+    assert_eq!(unsafe { buf.view_at(16) }.len_bytes(), 0);
+}
+
+#[test]
 #[ignore = "benchmark: prints numbers, asserts nothing"]
 fn alloc_cost() {
     let q = Queue::new(0).unwrap();

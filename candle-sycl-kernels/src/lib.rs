@@ -556,10 +556,13 @@ impl DeviceBuffer {
     ///
     /// # Safety
     ///
-    /// As [`DeviceBuffer::view`], and `byte_off` must be within the buffer.
+    /// As [`DeviceBuffer::view`]. Panics if `byte_off` is past the end.
     pub unsafe fn view_at(&self, byte_off: usize) -> Self {
-        debug_assert!(byte_off <= self.len_bytes);
-        let byte_off = byte_off.min(self.len_bytes);
+        assert!(
+            byte_off <= self.len_bytes,
+            "view_at: offset {byte_off} is past the end of a {}-byte buffer",
+            self.len_bytes
+        );
         Self {
             ptr: unsafe { (self.ptr as *mut u8).add(byte_off) as *mut c_void },
             len_bytes: self.len_bytes - byte_off,
@@ -613,6 +616,12 @@ impl DeviceBuffer {
     }
 
     pub fn copy_from_device(&self, src: &DeviceBuffer, bytes: usize) -> Result<()> {
+        assert!(
+            bytes <= src.len_bytes && bytes <= self.len_bytes,
+            "memcpy_dtod: {bytes} bytes from a {}-byte buffer into a {}-byte one",
+            src.len_bytes,
+            self.len_bytes
+        );
         check(
             unsafe { candle_sycl_memcpy_dtod(self.queue.raw, self.ptr, src.ptr, bytes) },
             "memcpy_dtod",
