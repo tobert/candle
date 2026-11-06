@@ -29,6 +29,7 @@ extern "C" {
     pub fn candle_sycl_queue_native(q: *mut CandleSyclQueue) -> *mut c_void;
     pub fn candle_sycl_synchronize(q: *mut CandleSyclQueue) -> c_int;
     pub fn candle_sycl_wait(q: *mut CandleSyclQueue) -> c_int;
+    pub fn candle_sycl_debug_fail_next_wait(q: *mut CandleSyclQueue, status: c_int);
     pub fn candle_sycl_device_info(
         q: *mut CandleSyclQueue,
         out: *mut CandleSyclDeviceInfo,

@@ -186,6 +186,49 @@ fn batched_gemm_matches_loop() {
     }
 }
 
+/// A wait failure seen by an internal flush (here `drain_pool`; also
+/// `defer_free`'s batched free) cannot be returned from there, but must not be
+/// lost: the next synchronize reports it, once.
+#[test]
+fn a_failed_internal_flush_reaches_synchronize() {
+    let q = Queue::new(0).unwrap();
+    q.fail_next_wait_for_test(7);
+    q.drain_pool();
+    let err = q
+        .synchronize()
+        .expect_err("the flush's failure must reach synchronize");
+    assert!(err.to_string().contains("status 7"), "unexpected error: {err}");
+    q.synchronize().unwrap();
+}
+
+/// As above, for the first device-to-host copy: async device-to-device copies
+/// and memsets report execution failures only at a later wait, and a host
+/// copy is where most callers look.
+#[test]
+fn a_failed_internal_flush_reaches_copy_to_host() {
+    let q = Queue::new(0).unwrap();
+    let buf = DeviceBuffer::alloc(&q, 16).unwrap();
+    buf.memset_zero().unwrap();
+    q.fail_next_wait_for_test(7);
+    q.drain_pool();
+    let mut host = [0u8; 16];
+    let err = buf
+        .copy_to_host(&mut host)
+        .expect_err("the flush's failure must reach the host copy");
+    assert!(err.to_string().contains("status 7"), "unexpected error: {err}");
+    buf.copy_to_host(&mut host).unwrap();
+    assert_eq!(host, [0u8; 16]);
+}
+
+/// A failure in the reporting wait itself is returned there and not again.
+#[test]
+fn a_failed_synchronize_is_reported_once() {
+    let q = Queue::new(0).unwrap();
+    q.fail_next_wait_for_test(7);
+    q.synchronize().expect_err("the injected failure");
+    q.synchronize().unwrap();
+}
+
 #[test]
 #[should_panic(expected = "memcpy_dtod")]
 fn copy_from_device_refuses_more_than_the_source_holds() {

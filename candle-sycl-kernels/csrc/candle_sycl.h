@@ -56,6 +56,13 @@ int candle_sycl_device_count(void);
 CandleSyclQueue *candle_sycl_queue_new(int ordinal);
 void candle_sycl_queue_free(CandleSyclQueue *q);
 int candle_sycl_synchronize(CandleSyclQueue *q);
+// Wait for submitted work without reporting: records a failure for the next
+// reporting call (and returns it too), never reads or clears the guard. For
+// internal flushes that cannot propagate an error.
+int candle_sycl_wait(CandleSyclQueue *q);
+// Test hook: the next wait on `q` fails with `status` (nonzero), as if the
+// device had raised an execution error. Not for production use.
+void candle_sycl_debug_fail_next_wait(CandleSyclQueue *q, int status);
 // The underlying `sycl::queue *` as an opaque pointer, for out-of-tree kernels
 // (e.g. crane's fused GDN launcher) that link their own `.so` and need to
 // submit onto candle's in-order queue. Cast back to `sycl::queue *`.
@@ -80,8 +87,15 @@ int candle_sycl_device_info(CandleSyclQueue *q, CandleSyclDeviceInfo *out);
 // USM device allocation. Returns NULL on failure.
 void *candle_sycl_malloc(CandleSyclQueue *q, size_t bytes);
 void candle_sycl_free(CandleSyclQueue *q, void *ptr);
+// Error reporting: an execution error is seen only by a host wait. A wait that
+// cannot report it (candle_sycl_wait) records it on the queue; the reporting
+// calls (candle_sycl_synchronize, memcpy_htod, memcpy_dtoh) return the first
+// recorded error, once, before anything else. The device guard is reported by
+// synchronize and memcpy_dtoh only.
 int candle_sycl_memcpy_htod(CandleSyclQueue *q, void *dst, const void *src, size_t bytes);
 int candle_sycl_memcpy_dtoh(CandleSyclQueue *q, void *dst, const void *src, size_t bytes);
+// Device-to-device copy and memset do not wait on the host: their return
+// reports submission only, and an execution failure surfaces at a later wait.
 int candle_sycl_memcpy_dtod(CandleSyclQueue *q, void *dst, const void *src, size_t bytes);
 // Byte-wise memset (used for zeroing).
 int candle_sycl_memset(CandleSyclQueue *q, void *dst, int value, size_t bytes);

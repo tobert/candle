@@ -65,6 +65,42 @@ int take_guard(CandleSyclQueue *q) {
   q->q.memcpy(&code, g + 1, sizeof(code)).wait_and_throw();
   return code ? CANDLE_SYCL_ERR_DEVICE_GUARD_BASE + code : CANDLE_SYCL_OK;
 }
+
+// Wait for all submitted work. A failure — a thrown exception, an error the
+// async handler collected, or the test hook — is recorded in `pending` (the
+// first one wins) and returned. Does not read the guard and does not clear
+// `pending`, so a caller that cannot propagate the status loses nothing.
+int wait_record(CandleSyclQueue *q) {
+  int s = CANDLE_SYCL_OK;
+  try {
+    q->q.wait_and_throw();
+  } catch (const std::exception &e) {
+    std::fprintf(stderr, "candle-sycl: queue wait failed: %s\n", e.what());
+    s = CANDLE_SYCL_ERR_EXCEPTION;
+  } catch (...) {
+    s = CANDLE_SYCL_ERR_EXCEPTION;
+  }
+  if (int a = q->async_err.exchange(0); a && !s) s = a;
+  if (int i = q->inject.exchange(0); i && !s) s = i;
+  if (s) {
+    int zero = 0;
+    q->pending.compare_exchange_strong(zero, s);
+  }
+  return s;
+}
+
+// A reporting wait: wait, then hand back (and clear) the first unreported
+// failure; if there is none and `peek` shows the guard flag set, report the
+// guard. Each failure is returned exactly once.
+int wait_report(CandleSyclQueue *q, const int32_t *peek) {
+  wait_record(q);
+  if (int p = q->pending.exchange(0)) return p;
+  try {
+    return peek && *peek ? take_guard(q) : CANDLE_SYCL_OK;
+  } catch (...) {
+    return CANDLE_SYCL_ERR_EXCEPTION;
+  }
+}
 } // namespace
 
 extern "C" {
@@ -78,23 +114,23 @@ int candle_sycl_synchronize(CandleSyclQueue *q) {
     if (q->guard) {
       q->q.memcpy(&peek, q->guard, sizeof(peek));
     }
-    q->q.wait_and_throw();
-    return peek ? take_guard(q) : CANDLE_SYCL_OK;
+    return wait_report(q, &peek);
   } catch (...) {
+    // The peek's submission failed; the wait still owes its report.
+    wait_record(q);
     return CANDLE_SYCL_ERR_EXCEPTION;
   }
 }
 
+void candle_sycl_debug_fail_next_wait(CandleSyclQueue *q, int status) { q->inject.store(status); }
+
 int candle_sycl_wait(CandleSyclQueue *q) {
-  // Wait without reading the guard flag: internal flushes (defer_free,
-  // drain_pool, queue drop) must not consume a guard error the caller's
-  // synchronize has not seen yet.
-  try {
-    q->q.wait_and_throw();
-    return CANDLE_SYCL_OK;
-  } catch (...) {
-    return CANDLE_SYCL_ERR_EXCEPTION;
-  }
+  // Wait without reading the guard flag or clearing a pending error: the
+  // internal flushes (defer_free, drain_pool, queue drop) cannot return an
+  // error to anyone, so a failure they see stays pending for the next
+  // synchronize or host copy, and they must not consume a guard error the
+  // caller has not seen yet.
+  return wait_record(q);
 }
 
 int candle_sycl_device_info(CandleSyclQueue *q, CandleSyclDeviceInfo *out) {
@@ -147,12 +183,15 @@ void candle_sycl_free(CandleSyclQueue *q, void *ptr) {
 }
 
 int candle_sycl_memcpy_htod(CandleSyclQueue *q, void *dst, const void *src, size_t bytes) {
+  // Reports a pending execution error (as every host-waiting call does), but
+  // not the device guard: an upload is not where results are read.
   try {
-    if (bytes) q->q.memcpy(dst, src, bytes).wait_and_throw();
-    return CANDLE_SYCL_OK;
+    if (bytes) q->q.memcpy(dst, src, bytes);
   } catch (...) {
+    wait_record(q);
     return CANDLE_SYCL_ERR_EXCEPTION;
   }
+  return wait_report(q, nullptr);
 }
 int candle_sycl_memcpy_dtoh(CandleSyclQueue *q, void *dst, const void *src, size_t bytes) {
   // A device-to-host copy is where a caller first sees results (lfm2d reads
@@ -162,16 +201,18 @@ int candle_sycl_memcpy_dtoh(CandleSyclQueue *q, void *dst, const void *src, size
     int32_t peek = 0;
     if (bytes) q->q.memcpy(dst, src, bytes);
     if (q->guard) q->q.memcpy(&peek, q->guard, sizeof(peek));
-    q->q.wait_and_throw();
-    return peek ? take_guard(q) : CANDLE_SYCL_OK;
+    return wait_report(q, &peek);
   } catch (...) {
+    // A submission failed; drain the queue before `peek` leaves scope.
+    wait_record(q);
     return CANDLE_SYCL_ERR_EXCEPTION;
   }
 }
 int candle_sycl_memcpy_dtod(CandleSyclQueue *q, void *dst, const void *src, size_t bytes) {
   // Device-to-device: the in-order queue orders this against every later
   // kernel, so waiting on the host here only serializes submits. Host copies
-  // must still wait — the host buffer need not outlive the call.
+  // must still wait — the host buffer need not outlive the call. An execution
+  // failure surfaces at a later wait, which records it until reported.
   try {
     if (bytes) q->q.memcpy(dst, src, bytes);
     return CANDLE_SYCL_OK;

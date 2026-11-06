@@ -309,8 +309,17 @@ impl Queue {
     /// go unseen. Only the public [`Queue::synchronize`] and
     /// [`DeviceBuffer::copy_to_host`], whose errors reach a caller, read and
     /// clear it.
-    fn wait(&self) -> Result<()> {
-        check(unsafe { candle_sycl_wait(self.raw) }, "wait")
+    ///
+    /// A failure it sees is kept on the queue and returned by the next
+    /// `synchronize` or host copy; the callers here cannot return it, so this
+    /// says so on stderr instead of letting the flush look clean.
+    fn wait(&self, during: &str) {
+        if let Err(e) = check(unsafe { candle_sycl_wait(self.raw) }, "wait") {
+            eprintln!(
+                "candle-sycl: {e} during {during}; it will be returned by the next \
+                 synchronize or host copy"
+            );
+        }
     }
 
     fn pool_take(&self, len: usize) -> Option<*mut c_void> {
@@ -353,7 +362,7 @@ impl Queue {
             }
             std::mem::take(&mut *pending).ptrs
         };
-        let _ = self.wait();
+        self.wait("a deferred free");
         for p in batch {
             unsafe { candle_sycl_free(self.raw, p) }
         }
@@ -364,7 +373,7 @@ impl Queue {
         // Synchronize first, for the reason in [`Queue::defer_free`]: a pooled
         // pointer's `DeviceBuffer` was dropped, which says nothing about whether
         // the kernels reading it have run.
-        let _ = self.wait();
+        self.wait("drain_pool");
         let pending = std::mem::take(&mut *self.pending_free.lock().unwrap()).ptrs;
         let mut pool = self.pool.lock().unwrap();
         for (_, ptrs) in pool.buckets.drain() {
@@ -381,6 +390,14 @@ impl Queue {
 
     pub fn device_count() -> usize {
         unsafe { candle_sycl_device_count() as usize }
+    }
+
+    /// Test hook: the next wait on this queue fails with `status`, as if the
+    /// device had raised an execution error. For exercising the error paths
+    /// of the internal flushes, which no real fault reaches deterministically.
+    #[doc(hidden)]
+    pub fn fail_next_wait_for_test(&self, status: i32) {
+        unsafe { candle_sycl_debug_fail_next_wait(self.raw, status as c_int) }
     }
 
     pub fn synchronize(&self) -> Result<()> {
@@ -448,8 +465,12 @@ impl Queue {
 impl Drop for Queue {
     fn drop(&mut self) {
         // Buffers freed here may still be referenced by enqueued kernels;
-        // `sycl::free` does not wait for them.
-        let _ = self.wait();
+        // `sycl::free` does not wait for them. Nobody is left to return an
+        // error to, so a failure still unreported (an execution error, a
+        // tripped guard) goes to stderr rather than vanishing with the queue.
+        if let Err(e) = self.synchronize() {
+            eprintln!("candle-sycl: queue dropped with an unreported error: {e}");
+        }
         for p in std::mem::take(self.pending_free.get_mut().unwrap()).ptrs {
             unsafe { candle_sycl_free(self.raw, p) }
         }
@@ -581,6 +602,8 @@ impl DeviceBuffer {
         self.ptr
     }
 
+    /// Copy from the host, waiting for all prior work on the queue. Returns
+    /// an execution error an earlier internal flush recorded, if any.
     pub fn copy_from_host(&self, src: &[u8]) -> Result<()> {
         assert!(src.len() <= self.len_bytes);
         check(
@@ -597,7 +620,8 @@ impl DeviceBuffer {
     }
 
     /// Copy to the host, waiting for all prior work on the queue. Reports (and
-    /// clears) a tripped device guard as [`Queue::synchronize`] does: this is
+    /// clears) a recorded execution error or a tripped device guard as
+    /// [`Queue::synchronize`] does: this is
     /// the first host-visible point after a decode step, and callers that
     /// never synchronize must still see a bad expert id.
     pub fn copy_to_host(&self, dst: &mut [u8]) -> Result<()> {
