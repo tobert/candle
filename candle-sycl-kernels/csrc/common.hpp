@@ -51,8 +51,10 @@ struct CandleSyclQueue {
                 std::fprintf(stderr, "candle-sycl: async error (non-standard exception)\n");
               }
             }
-            int zero = 0;
-            async_err.compare_exchange_strong(zero, CANDLE_SYCL_ERR_EXCEPTION);
+            if (errs.size() != 0) {
+              int zero = 0;
+              async_err.compare_exchange_strong(zero, CANDLE_SYCL_ERR_EXCEPTION);
+            }
           },
           sycl::property::queue::in_order{}),
         guard(static_cast<int32_t *>(sycl::malloc_device(2 * sizeof(int32_t), q))) {
@@ -60,7 +62,11 @@ struct CandleSyclQueue {
       q.memset(guard, 0, 2 * sizeof(int32_t)).wait();
     }
   }
-  ~CandleSyclQueue() {
+  // Frees the guard before `q` is destroyed: safe because every user of the
+  // guard waits for its own work (take_guard, the peeks) and Queue::drop
+  // synchronizes first. Throws only on a lost device; candle_sycl_queue_free
+  // catches it.
+  ~CandleSyclQueue() noexcept(false) {
     if (guard) {
       sycl::free(guard, q);
     }

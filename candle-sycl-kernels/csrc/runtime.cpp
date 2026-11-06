@@ -40,7 +40,16 @@ CandleSyclQueue *candle_sycl_queue_new(int ordinal) {
   }
 }
 
-void candle_sycl_queue_free(CandleSyclQueue *q) { delete q; }
+void candle_sycl_queue_free(CandleSyclQueue *q) {
+  // Teardown of a broken queue may throw; an exception must not cross the C ABI.
+  try {
+    delete q;
+  } catch (const std::exception &e) {
+    std::fprintf(stderr, "candle-sycl: queue teardown failed: %s\n", e.what());
+  } catch (...) {
+    std::fprintf(stderr, "candle-sycl: queue teardown failed\n");
+  }
+}
 
 void *candle_sycl_queue_native(CandleSyclQueue *q) { return &q->q; }
 
@@ -177,8 +186,15 @@ void *candle_sycl_malloc(CandleSyclQueue *q, size_t bytes) {
 }
 
 void candle_sycl_free(CandleSyclQueue *q, void *ptr) {
-  if (ptr) {
-    sycl::free(ptr, q->q);
+  // sycl::free can throw (a lost device); an exception must not cross the C ABI.
+  try {
+    if (ptr) {
+      sycl::free(ptr, q->q);
+    }
+  } catch (const std::exception &e) {
+    std::fprintf(stderr, "candle-sycl: free failed: %s\n", e.what());
+  } catch (...) {
+    std::fprintf(stderr, "candle-sycl: free failed\n");
   }
 }
 
