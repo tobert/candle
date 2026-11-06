@@ -376,6 +376,60 @@ impl candle::CustomOp3 for RotaryEmbI {
     }
 }
 
+/// Check a cos/sin pair against an input of `b_sz` batches, `seq_len` steps and
+/// head dim `n_embd`, and hand back the tables the kernels can read.
+///
+/// - An unbatched `(rows, d/2)` table needs `rows >= seq_len` and must be
+///   contiguous; every kernel reads its first `seq_len` rows.
+/// - A batched `(b, rows, d/2)` table needs `rows >= seq_len` too. Every kernel
+///   offsets batch `b_i` by `b_i * seq_len` rows, so a longer table would have
+///   batch 1 onward read the tail of batch 0: it is cut to its first `seq_len`
+///   rows per batch, and made contiguous (a copy only when it was not already
+///   exactly that), so a caller's own `narrow(1, 0, seq_len)` view is taken.
+/// - cos and sin must have the same rank: the kernels take a pair as batched
+///   only when both are, so a mixed pair would read batch 0's rows for all.
+fn rope_prepare_cs(
+    cos: &Tensor,
+    sin: &Tensor,
+    b_sz: usize,
+    seq_len: usize,
+    n_embd: usize,
+) -> Result<(Tensor, Tensor)> {
+    let (cos_seq_len, cos_n_embd) = rope_check_cs(cos, b_sz)?;
+    let (sin_seq_len, sin_n_embd) = rope_check_cs(sin, b_sz)?;
+    if cos.rank() != sin.rank() {
+        candle::bail!(
+            "cos and sin must both be batched or both unbatched in rope {:?} {:?}",
+            cos.shape(),
+            sin.shape()
+        )
+    }
+    if cos_n_embd * 2 != n_embd || sin_n_embd * 2 != n_embd {
+        candle::bail!(
+            "inconsistent last dim size in rope: head dim {n_embd}, cos {:?}, sin {:?}",
+            cos.shape(),
+            sin.shape()
+        )
+    }
+    if seq_len > cos_seq_len || seq_len > sin_seq_len {
+        candle::bail!(
+            "rope table shorter than the sequence ({seq_len} steps): cos {:?}, sin {:?}",
+            cos.shape(),
+            sin.shape()
+        )
+    }
+    let prepare = |cs: &Tensor, what: &str| -> Result<Tensor> {
+        if cs.rank() == 3 {
+            cs.narrow(1, 0, seq_len)?.contiguous()
+        } else if !cs.is_contiguous() {
+            candle::bail!("{what} has to be contiguous in rope")
+        } else {
+            Ok(cs.clone())
+        }
+    };
+    Ok((prepare(cos, "cos")?, prepare(sin, "sin")?))
+}
+
 fn rope_check_cs(cs: &Tensor, b_sz: usize) -> Result<(usize, usize)> {
     match *cs.dims() {
         [t, d] => Ok((t, d)),
@@ -389,32 +443,16 @@ fn rope_check_cs(cs: &Tensor, b_sz: usize) -> Result<(usize, usize)> {
     }
 }
 
+/// The cos/sin table is `(rows, d/2)` or, per batch, `(b, rows, d/2)`, with
+/// `rows >= seq_len`: the first `seq_len` rows are read (per batch when
+/// batched). See `rope_prepare_cs` for what is refused.
 pub fn rope_i(xs: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
     let (b_sz, _n_head, seq_len, n_embd) = xs.dims4()?;
-    let (cos_seq_len, cos_n_embd) = rope_check_cs(cos, b_sz)?;
-    let (sin_seq_len, sin_n_embd) = rope_check_cs(sin, b_sz)?;
-    if cos_n_embd * 2 != n_embd
-        || sin_n_embd * 2 != n_embd
-        || seq_len > cos_seq_len
-        || seq_len > sin_seq_len
-    {
-        candle::bail!(
-            "inconsistent last dim size in rope {:?} {:?} {:?}",
-            xs.shape(),
-            cos.shape(),
-            sin.shape()
-        )
-    }
     if !xs.is_contiguous() {
         candle::bail!("xs has to be contiguous in rope")
     }
-    if !cos.is_contiguous() {
-        candle::bail!("cos has to be contiguous in rope")
-    }
-    if !sin.is_contiguous() {
-        candle::bail!("sin has to be contiguous in rope")
-    }
-    xs.apply_op3_no_bwd(cos, sin, &RotaryEmbI)
+    let (cos, sin) = rope_prepare_cs(cos, sin, b_sz, seq_len, n_embd)?;
+    xs.apply_op3_no_bwd(&cos, &sin, &RotaryEmbI)
 }
 
 pub fn rope_i_slow(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
@@ -752,32 +790,16 @@ impl candle::CustomOp3 for RotaryEmb {
     }
 }
 
+/// The cos/sin table is `(rows, d/2)` or, per batch, `(b, rows, d/2)`, with
+/// `rows >= seq_len`: the first `seq_len` rows are read (per batch when
+/// batched). See `rope_prepare_cs` for what is refused.
 pub fn rope(xs: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
     let (b_sz, _n_head, seq_len, n_embd) = xs.dims4()?;
-    let (cos_seq_len, cos_n_embd) = rope_check_cs(cos, b_sz)?;
-    let (sin_seq_len, sin_n_embd) = rope_check_cs(sin, b_sz)?;
-    if cos_n_embd * 2 != n_embd
-        || sin_n_embd * 2 != n_embd
-        || seq_len > cos_seq_len
-        || seq_len > sin_seq_len
-    {
-        candle::bail!(
-            "inconsistent last dim size in rope {:?} {:?} {:?}",
-            xs.shape(),
-            cos.shape(),
-            sin.shape()
-        )
-    }
     if !xs.is_contiguous() {
         candle::bail!("xs has to be contiguous in rope")
     }
-    if !cos.is_contiguous() {
-        candle::bail!("cos has to be contiguous in rope")
-    }
-    if !sin.is_contiguous() {
-        candle::bail!("sin has to be contiguous in rope")
-    }
-    xs.apply_op3_no_bwd(cos, sin, &RotaryEmb)
+    let (cos, sin) = rope_prepare_cs(cos, sin, b_sz, seq_len, n_embd)?;
+    xs.apply_op3_no_bwd(&cos, &sin, &RotaryEmb)
 }
 
 fn rotate_half(xs: &Tensor) -> Result<Tensor> {
@@ -1097,32 +1119,16 @@ impl candle::CustomOp3 for RotaryEmbThd {
     }
 }
 
+/// The cos/sin table is `(rows, d/2)` or, per batch, `(b, rows, d/2)`, with
+/// `rows >= seq_len`: the first `seq_len` rows are read (per batch when
+/// batched). See `rope_prepare_cs` for what is refused.
 pub fn rope_thd(xs: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
     let (b_sz, seq_len, _n_head, n_embd) = xs.dims4()?;
-    let (cos_seq_len, cos_n_embd) = rope_check_cs(cos, b_sz)?;
-    let (sin_seq_len, sin_n_embd) = rope_check_cs(sin, b_sz)?;
-    if cos_n_embd * 2 != n_embd
-        || sin_n_embd * 2 != n_embd
-        || seq_len > cos_seq_len
-        || seq_len > sin_seq_len
-    {
-        candle::bail!(
-            "inconsistent last dim size in rope {:?} {:?} {:?}",
-            xs.shape(),
-            cos.shape(),
-            sin.shape()
-        )
-    }
     if !xs.is_contiguous() {
         candle::bail!("xs has to be contiguous in rope")
     }
-    if !cos.is_contiguous() {
-        candle::bail!("cos has to be contiguous in rope")
-    }
-    if !sin.is_contiguous() {
-        candle::bail!("sin has to be contiguous in rope")
-    }
-    xs.apply_op3_no_bwd(cos, sin, &RotaryEmbThd)
+    let (cos, sin) = rope_prepare_cs(cos, sin, b_sz, seq_len, n_embd)?;
+    xs.apply_op3_no_bwd(&cos, &sin, &RotaryEmbThd)
 }
 
 #[cfg(all(test, feature = "rocm"))]
