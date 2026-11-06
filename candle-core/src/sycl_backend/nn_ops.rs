@@ -179,20 +179,29 @@ pub fn rope(
             sl.dims().len()
         );
     }
-    // Batched cos/sin are (b, t, d/2); unbatched ones cover one (t, d/2) table.
-    let expected = if batched { b * t * half } else { t * half };
-    if cl.shape().elem_count() != expected {
-        crate::bail!(
-            "sycl rope: cos has {} elements, expected {expected} for mode {mode} \
-             (b {b}, t {t}, half {half})",
-            cl.shape().elem_count()
-        );
-    }
-    if sl.shape().elem_count() != expected {
-        crate::bail!(
-            "sycl rope: sin has {} elements, expected {expected} for mode {mode}",
-            sl.shape().elem_count()
-        );
+    // Batched cos/sin are (b, t, d/2): the kernel offsets batch b_i by b_i * t
+    // rows, so each batch holds exactly t rows (candle_nn's wrappers cut a
+    // longer batched table down before it gets here). An unbatched (rows, d/2)
+    // table may run past the sequence, as on every other backend: the kernel
+    // reads its first t rows.
+    for (what, l) in [("cos", cl), ("sin", sl)] {
+        let ok = match *l.dims() {
+            [rb, rows, hd] => rb == b && rows == t && hd == half,
+            [rows, hd] => rows >= t && hd == half,
+            _ => false,
+        };
+        if !ok {
+            let want = if batched {
+                format!("({b}, {t}, {half})")
+            } else {
+                format!("(>= {t}, {half})")
+            };
+            crate::bail!(
+                "sycl rope: {what} is {:?}, expected {want} for mode {mode} \
+                 (b {b}, t {t}, half {half})",
+                l.shape()
+            );
+        }
     }
     let x = densify(x, xl, "rope x")?;
     let x = x.get();
